@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/budget"
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/planner"
@@ -57,15 +58,21 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	flags.SetOutput(stderr)
 	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
 	configPath := flags.String("config", defaultConfigPath, "runtime config path")
-	budgetCents := flags.Int64("budget-cents", 1000, "total budget in cents")
+	budgetCents := flags.Int64("budget-cents", 0, "override total budget in cents")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
+	budgetOverridden := false
+	flags.Visit(func(current *flag.Flag) {
+		if current.Name == "budget-cents" {
+			budgetOverridden = true
+		}
+	})
 	if len(flags.Args()) != 1 {
 		fmt.Fprintln(stderr, "run requires a GitHub pull request URL")
 		return 2
 	}
-	if *budgetCents <= 0 || *budgetCents > math.MaxInt64/microsPerCent {
+	if budgetOverridden && !validBudgetCents(*budgetCents) {
 		fmt.Fprintln(stderr, "budget-cents must be a positive integer within range")
 		return 2
 	}
@@ -75,12 +82,21 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "parse pull request URL: %v\n", err)
 		return 2
 	}
-	store, _, err := openStore(ctx, *dbPath, *configPath)
+	store, runtimeConfig, err := openStore(ctx, *dbPath, *configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
 		return 1
 	}
 	defer store.Close()
+
+	effectiveBudgetCents := runtimeConfig.DefaultBudgetCents
+	if budgetOverridden {
+		effectiveBudgetCents = *budgetCents
+	}
+	if !validBudgetCents(effectiveBudgetCents) {
+		fmt.Fprintln(stderr, "configured default budget is outside the supported range")
+		return 1
+	}
 
 	apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
 	if apiBaseURL == "" {
@@ -113,7 +129,7 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		Repository:        ref.Owner + "/" + ref.Repository,
 		ChangeNumber:      ref.Number,
 		Status:            domain.RunStatusFetched,
-		BudgetLimitMicros: *budgetCents * microsPerCent,
+		BudgetLimitMicros: effectiveBudgetCents * microsPerCent,
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
@@ -134,6 +150,11 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	}
 	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\nunits=%d\nredactions=%d\nexcluded_files=%d\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA, len(units), len(sanitized.Redactions), len(sanitized.ExcludedFiles))
 	return 0
+}
+
+// validBudgetCents 确保预算为正数，并且转换成微美元后不会溢出。
+func validBudgetCents(value int64) bool {
+	return value > 0 && value <= math.MaxInt64/microsPerCent
 }
 
 // executeDemo 写入一个固定的离线 Run，包含不同 checkpoint 状态的 Unit。
@@ -206,6 +227,11 @@ func executeStatus(ctx context.Context, args []string, stdout, stderr io.Writer)
 	for _, unit := range units {
 		counts[unit.Status]++
 	}
+	budgetSummary, err := budget.NewManager(store).Summary(ctx, run.ID)
+	if err != nil {
+		fmt.Fprintf(stderr, "summarize budget: %v\n", err)
+		return 1
+	}
 	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\nunits=%d\n", run.ID, run.Status, len(units))
 	for _, status := range []domain.UnitStatus{
 		domain.UnitStatusPending,
@@ -216,6 +242,7 @@ func executeStatus(ctx context.Context, args []string, stdout, stderr io.Writer)
 	} {
 		fmt.Fprintf(stdout, "%s=%d\n", status, counts[status])
 	}
+	fmt.Fprintf(stdout, "budget_limit_micros=%d\nbudget_reserved_micros=%d\nbudget_actual_micros=%d\nbudget_committed_micros=%d\n", run.BudgetLimitMicros, budgetSummary.ReservedMicros, budgetSummary.ActualMicros, budgetSummary.CommittedMicros)
 	return 0
 }
 

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/budget"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/migrations"
 	_ "modernc.org/sqlite"
@@ -249,6 +250,124 @@ func (s *Store) SavePlan(ctx context.Context, runID string, units []domain.Revie
 		return fmt.Errorf("commit save plan: %w", err)
 	}
 	return nil
+}
+
+// ReserveBudget 用单条写语句原子检查 Run 上限并创建费用预留。
+func (s *Store) ReserveBudget(ctx context.Context, reservation budget.Reservation) error {
+	result, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO budget_ledger (
+			id, run_id, unit_id, tier, status, reserved_micros, created_at
+		)
+		SELECT ?, ?, ?, ?, ?, ?, ?
+		WHERE ? + COALESCE((
+			SELECT SUM(CASE status WHEN 'reserved' THEN reserved_micros WHEN 'settled' THEN actual_micros ELSE 0 END)
+			FROM budget_ledger WHERE run_id = ?
+		), 0) <= COALESCE((SELECT budget_limit_micros FROM runs WHERE id = ?), -1)`,
+		reservation.ID, reservation.RunID, reservation.UnitID, reservation.Tier, budget.StatusReserved,
+		reservation.ReservedMicros, timeText(reservation.CreatedAt), reservation.ReservedMicros,
+		reservation.RunID, reservation.RunID,
+	)
+	if err != nil {
+		return fmt.Errorf("insert budget reservation: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read reservation result: %w", err)
+	}
+	if inserted == 1 {
+		return nil
+	}
+
+	var existing budget.Reservation
+	var existingStatus string
+	err = s.db.QueryRowContext(ctx, `
+		SELECT id, run_id, unit_id, tier, reserved_micros, status
+		FROM budget_ledger WHERE id = ?`, reservation.ID,
+	).Scan(&existing.ID, &existing.RunID, &existing.UnitID, &existing.Tier, &existing.ReservedMicros, &existingStatus)
+	if err == nil && existingStatus == budget.StatusReserved && existing.ID == reservation.ID && existing.RunID == reservation.RunID && existing.UnitID == reservation.UnitID && existing.Tier == reservation.Tier && existing.ReservedMicros == reservation.ReservedMicros {
+		return nil
+	}
+	if err == nil {
+		return budget.ErrReservationConflict
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read existing reservation: %w", err)
+	}
+	return budget.ErrLimitExceeded
+}
+
+func (s *Store) SettleBudget(ctx context.Context, reservationID string, usage budget.Usage) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE budget_ledger
+		SET status = ?, actual_micros = ?, input_tokens = ?, output_tokens = ?
+		WHERE id = ? AND status = ? AND ? <= reserved_micros`,
+		budget.StatusSettled, usage.ActualMicros, usage.InputTokens, usage.OutputTokens,
+		reservationID, budget.StatusReserved, usage.ActualMicros,
+	)
+	if err != nil {
+		return fmt.Errorf("settle budget reservation: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read settlement result: %w", err)
+	}
+	if changed != 1 {
+		var status string
+		var actualMicros, inputTokens, outputTokens int64
+		err := s.db.QueryRowContext(ctx, `
+			SELECT status, actual_micros, input_tokens, output_tokens
+			FROM budget_ledger WHERE id = ?`, reservationID,
+		).Scan(&status, &actualMicros, &inputTokens, &outputTokens)
+		if err == nil && status == budget.StatusSettled && actualMicros == usage.ActualMicros && inputTokens == usage.InputTokens && outputTokens == usage.OutputTokens {
+			return nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read settled reservation: %w", err)
+		}
+		return fmt.Errorf("reservation %q cannot be settled", reservationID)
+	}
+	return nil
+}
+
+func (s *Store) ReleaseBudget(ctx context.Context, reservationID string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE budget_ledger SET status = ? WHERE id = ? AND status = ?`,
+		budget.StatusReleased, reservationID, budget.StatusReserved,
+	)
+	if err != nil {
+		return fmt.Errorf("release budget reservation: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read release result: %w", err)
+	}
+	if changed != 1 {
+		var status string
+		err := s.db.QueryRowContext(ctx, `SELECT status FROM budget_ledger WHERE id = ?`, reservationID).Scan(&status)
+		if err == nil && status == budget.StatusReleased {
+			return nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read released reservation: %w", err)
+		}
+		return fmt.Errorf("reservation %q cannot be released", reservationID)
+	}
+	return nil
+}
+
+func (s *Store) BudgetSummary(ctx context.Context, runID string) (budget.Summary, error) {
+	var summary budget.Summary
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN status = 'reserved' THEN reserved_micros ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'settled' THEN actual_micros ELSE 0 END), 0),
+			COALESCE(SUM(CASE status WHEN 'reserved' THEN reserved_micros WHEN 'settled' THEN actual_micros ELSE 0 END), 0)
+		FROM budget_ledger WHERE run_id = ?`, runID,
+	).Scan(&summary.ReservedMicros, &summary.ActualMicros, &summary.CommittedMicros)
+	if err != nil {
+		return budget.Summary{}, fmt.Errorf("summarize budget: %w", err)
+	}
+	return summary, nil
 }
 
 // ClaimRun 获取或续期 Run 的 lease；其他 owner 只能在 lease 过期后接管。

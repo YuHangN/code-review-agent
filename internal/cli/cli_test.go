@@ -37,7 +37,7 @@ func TestExecuteDemoStatusAndResume(t *testing.T) {
 	if code := cli.Execute(ctx, []string{"status", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("status exit code = %d, stderr = %s", code, stderr.String())
 	}
-	for _, want := range []string{"status=created", "units=5", "pending=1", "running=1", "failed_recoverable=1", "completed=1", "skipped_budget=1"} {
+	for _, want := range []string{"status=created", "units=5", "pending=1", "running=1", "failed_recoverable=1", "completed=1", "skipped_budget=1", "budget_limit_micros=1000000", "budget_reserved_micros=0", "budget_actual_micros=0", "budget_committed_micros=0"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("status stdout = %q, want %q", stdout.String(), want)
 		}
@@ -180,6 +180,46 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	if storedRun.Status != domain.RunStatusPlanned || len(units) != 1 || units[0].Status != domain.UnitStatusPending {
 		t.Fatalf("run status = %q, units = %#v", storedRun.Status, units)
 	}
+	if storedRun.BudgetLimitMicros != 10_000_000 {
+		t.Fatalf("budget limit = %d, want CLI override 10000000", storedRun.BudgetLimitMicros)
+	}
+}
+
+func TestExecuteRunUsesConfiguredDefaultBudget(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/acme/payments/pulls/42":
+			writer.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(writer, `{"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}`)
+		case "/repos/acme/payments/compare/base-sha...head-sha":
+			fmt.Fprint(writer, "diff --git a/main.go b/main.go\n@@ -1 +1 @@\n+safe\n")
+		default:
+			t.Fatalf("unexpected request path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_API_BASE_URL", server.URL)
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "review.db")
+	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
+	var stdout, stderr bytes.Buffer
+	if code := cli.Execute(ctx, []string{"run", "--db", dbPath, "--config", configPath, "https://github.com/acme/payments/pull/42"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run exit code = %d, stderr = %s", code, stderr.String())
+	}
+	runID := strings.TrimPrefix(strings.Split(stdout.String(), "\n")[0], "run_id=")
+	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.BudgetLimitMicros != 7_500_000 {
+		t.Fatalf("budget limit = %d, want configured default 7500000", run.BudgetLimitMicros)
+	}
 }
 
 func writeRuntimeConfig(t *testing.T, ttl, interval, busyTimeout string) string {
@@ -188,7 +228,10 @@ func writeRuntimeConfig(t *testing.T, ttl, interval, busyTimeout string) string 
 	content := "runtime:\n" +
 		"  lease_ttl: " + ttl + "\n" +
 		"  lease_renew_interval: " + interval + "\n" +
-		"  sqlite_busy_timeout: " + busyTimeout + "\n"
+		"  sqlite_busy_timeout: " + busyTimeout + "\n" +
+		"review:\n" +
+		"  default_budget_cents: 750\n" +
+		"  currency: USD\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

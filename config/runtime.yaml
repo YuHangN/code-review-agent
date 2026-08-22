@@ -2,3 +2,6 @@ runtime:
   lease_ttl: 60s
   lease_renew_interval: 20s
   sqlite_busy_timeout: 5s
+review:
+  default_budget_cents: 1000
+  currency: USD
