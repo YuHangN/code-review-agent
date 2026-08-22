@@ -16,6 +16,7 @@ func TestLoadRuntimeParsesAndValidatesDurations(t *testing.T) {
 review:
   default_budget_cents: 750
   currency: USD
+  max_findings_per_unit: 5
 llm:
   default_tier: economy
   tiers:
@@ -44,6 +45,9 @@ llm:
 	}
 	if runtime.DefaultBudgetCents != 750 || runtime.Currency != "USD" {
 		t.Fatalf("default budget = %d %s, want 750 USD cents", runtime.DefaultBudgetCents, runtime.Currency)
+	}
+	if runtime.MaxFindingsPerUnit != 5 {
+		t.Fatalf("max findings per unit = %d, want 5", runtime.MaxFindingsPerUnit)
 	}
 	if runtime.DefaultLLMTier != "economy" {
 		t.Fatalf("default LLM tier = %q, want economy", runtime.DefaultLLMTier)
@@ -99,6 +103,7 @@ func TestLoadRuntimeRejectsUnknownDefaultLLMTier(t *testing.T) {
 review:
   default_budget_cents: 1000
   currency: USD
+  max_findings_per_unit: 5
 llm:
   default_tier: strong
   tiers:

@@ -5,6 +5,7 @@ runtime:
 review:
   default_budget_cents: 1000
   currency: USD
+  max_findings_per_unit: 5
 llm:
   default_tier: economy
   tiers:

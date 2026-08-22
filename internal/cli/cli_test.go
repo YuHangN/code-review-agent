@@ -232,6 +232,7 @@ func writeRuntimeConfig(t *testing.T, ttl, interval, busyTimeout string) string 
 		"review:\n" +
 		"  default_budget_cents: 750\n" +
 		"  currency: USD\n" +
+		"  max_findings_per_unit: 5\n" +
 		"llm:\n" +
 		"  default_tier: economy\n" +
 		"  tiers:\n" +

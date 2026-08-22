@@ -18,6 +18,7 @@ type Runtime struct {
 	SQLiteBusyTimeout  time.Duration
 	DefaultBudgetCents int64
 	Currency           string
+	MaxFindingsPerUnit int
 	DefaultLLMTier     string
 	LLMTiers           map[string]llm.Tier
 }
@@ -46,6 +47,7 @@ func LoadRuntime(path string) (Runtime, error) {
 		Review struct {
 			DefaultBudgetCents int64  `yaml:"default_budget_cents"`
 			Currency           string `yaml:"currency"`
+			MaxFindingsPerUnit int    `yaml:"max_findings_per_unit"`
 		} `yaml:"review"`
 		LLM struct {
 			DefaultTier string                `yaml:"default_tier"`
@@ -66,14 +68,14 @@ func LoadRuntime(path string) (Runtime, error) {
 			MaxOutputTokens:             tier.MaxOutputTokens,
 		}
 	}
-	runtime, err := parseRuntime(raw.Runtime.LeaseTTL, raw.Runtime.LeaseRenewInterval, raw.Runtime.SQLiteBusyTimeout, raw.Review.DefaultBudgetCents, raw.Review.Currency, raw.LLM.DefaultTier, tiers)
+	runtime, err := parseRuntime(raw.Runtime.LeaseTTL, raw.Runtime.LeaseRenewInterval, raw.Runtime.SQLiteBusyTimeout, raw.Review.DefaultBudgetCents, raw.Review.Currency, raw.Review.MaxFindingsPerUnit, raw.LLM.DefaultTier, tiers)
 	if err != nil {
 		return Runtime{}, fmt.Errorf("validate runtime config: %w", err)
 	}
 	return runtime, nil
 }
 
-func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaultBudgetCents int64, currency, defaultLLMTier string, tiers map[string]llm.Tier) (Runtime, error) {
+func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaultBudgetCents int64, currency string, maxFindingsPerUnit int, defaultLLMTier string, tiers map[string]llm.Tier) (Runtime, error) {
 	ttl, err := time.ParseDuration(leaseTTL)
 	if err != nil || ttl <= 0 {
 		return Runtime{}, fmt.Errorf("lease_ttl must be a positive duration")
@@ -92,6 +94,9 @@ func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaul
 	currency = strings.ToUpper(strings.TrimSpace(currency))
 	if currency != "USD" {
 		return Runtime{}, fmt.Errorf("currency must be USD")
+	}
+	if maxFindingsPerUnit <= 0 {
+		return Runtime{}, fmt.Errorf("max_findings_per_unit must be positive")
 	}
 	defaultLLMTier = strings.TrimSpace(defaultLLMTier)
 	if defaultLLMTier == "" {
@@ -112,6 +117,7 @@ func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaul
 		SQLiteBusyTimeout:  busyTimeout,
 		DefaultBudgetCents: defaultBudgetCents,
 		Currency:           currency,
+		MaxFindingsPerUnit: maxFindingsPerUnit,
 		DefaultLLMTier:     defaultLLMTier,
 		LLMTiers:           tiers,
 	}, nil
