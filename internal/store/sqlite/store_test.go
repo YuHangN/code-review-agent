@@ -158,3 +158,48 @@ func TestStoreClaimRunRejectsEmptyOwner(t *testing.T) {
 		t.Fatalf("ClaimRun with empty owner error = %v, want ErrLeaseOwnerRequired", err)
 	}
 }
+
+func TestStorePersistsImmutableSnapshot(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	run := domain.Run{
+		ID:                "run-001",
+		SourceURL:         "https://github.com/acme/payments/pull/42",
+		Provider:          "github",
+		Repository:        "acme/payments",
+		ChangeNumber:      42,
+		Status:            domain.RunStatusFetched,
+		BudgetLimitMicros: 1_000_000,
+		CreatedAt:         time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:         time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC),
+	}
+	if err := store.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := domain.ChangeSnapshot{
+		BaseSHA:    "base-sha",
+		HeadSHA:    "head-sha",
+		Diff:       "diff --git a/file.go b/file.go\n",
+		DiffSHA256: "hash",
+		CreatedAt:  time.Date(2026, 8, 22, 0, 1, 0, 0, time.UTC),
+	}
+	if err := store.SaveSnapshot(ctx, run.ID, snapshot); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.GetSnapshot(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BaseSHA != snapshot.BaseSHA || got.HeadSHA != snapshot.HeadSHA || got.Diff != snapshot.Diff || got.DiffSHA256 != snapshot.DiffSHA256 {
+		t.Fatalf("snapshot = %#v, want %#v", got, snapshot)
+	}
+	if err := store.SaveSnapshot(ctx, run.ID, snapshot); err == nil {
+		t.Fatal("saving a second snapshot succeeded, want immutable conflict")
+	}
+}

@@ -53,6 +53,32 @@ func TestStartRejectsUnitForDifferentRun(t *testing.T) {
 	}
 }
 
+func TestStartFetchedPersistsRunAndSnapshotTogether(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t)
+	service := workflow.NewService(store)
+	run := testRun("run-001")
+	run.Status = domain.RunStatusFetched
+	snapshot := domain.ChangeSnapshot{
+		BaseSHA:    "base-sha",
+		HeadSHA:    "head-sha",
+		Diff:       "diff --git a/file.go b/file.go\n",
+		DiffSHA256: "hash",
+		CreatedAt:  time.Date(2026, 8, 22, 0, 1, 0, 0, time.UTC),
+	}
+
+	if err := service.StartFetched(ctx, workflow.FetchedRunRequest{Run: run, Snapshot: snapshot}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetSnapshot(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HeadSHA != snapshot.HeadSHA || got.Diff != snapshot.Diff {
+		t.Fatalf("snapshot = %#v, want %#v", got, snapshot)
+	}
+}
+
 func TestResumeReturnsOnlyResumableUnits(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -207,6 +233,10 @@ type heartbeatStore struct {
 }
 
 func (s *heartbeatStore) CreateRun(context.Context, domain.Run, []domain.ReviewUnit) error {
+	return nil
+}
+
+func (s *heartbeatStore) CreateRunWithSnapshot(context.Context, domain.Run, []domain.ReviewUnit, domain.ChangeSnapshot) error {
 	return nil
 }
 

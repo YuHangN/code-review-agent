@@ -17,6 +17,7 @@ var (
 // Store 是 Workflow 在启动和恢复 Review 时所需的最小持久化能力。
 type Store interface {
 	CreateRun(ctx context.Context, run domain.Run, units []domain.ReviewUnit) error
+	CreateRunWithSnapshot(ctx context.Context, run domain.Run, units []domain.ReviewUnit, snapshot domain.ChangeSnapshot) error
 	ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error)
 	ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error)
 }
@@ -30,6 +31,13 @@ type Service struct {
 type StartRequest struct {
 	Run   domain.Run
 	Units []domain.ReviewUnit
+}
+
+// FetchedRunRequest 包含已固定 Snapshot 的新 Run。
+type FetchedRunRequest struct {
+	Run      domain.Run
+	Units    []domain.ReviewUnit
+	Snapshot domain.ChangeSnapshot
 }
 
 // ResumeResult 只返回仍需要继续审查的 Unit。
@@ -55,6 +63,22 @@ func (s Service) Start(ctx context.Context, request StartRequest) error {
 	}
 	if err := s.store.CreateRun(ctx, request.Run, request.Units); err != nil {
 		return fmt.Errorf("create run: %w", err)
+	}
+	return nil
+}
+
+// StartFetched 原子保存新 Run 及其不可变 Snapshot。
+func (s Service) StartFetched(ctx context.Context, request FetchedRunRequest) error {
+	if request.Run.ID == "" {
+		return ErrRunIDRequired
+	}
+	for _, unit := range request.Units {
+		if unit.RunID != request.Run.ID {
+			return ErrUnitRunMismatch
+		}
+	}
+	if err := s.store.CreateRunWithSnapshot(ctx, request.Run, request.Units, request.Snapshot); err != nil {
+		return fmt.Errorf("create fetched run: %w", err)
 	}
 	return nil
 }

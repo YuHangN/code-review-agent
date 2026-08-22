@@ -7,11 +7,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
+	"github.com/YuHangN/code-review-agent/internal/scm"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
@@ -19,6 +21,8 @@ import (
 const (
 	defaultDBPath     = "review-agent.db"
 	defaultConfigPath = "config/runtime.yaml"
+	defaultGitHubAPI  = "https://api.github.com"
+	microsPerCent     = int64(10_000)
 )
 
 // Execute 解析一个 CLI 子命令，并返回进程退出码。
@@ -30,6 +34,8 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	switch args[0] {
+	case "run":
+		return executeRun(ctx, args[1:], stdout, stderr)
 	case "demo":
 		return executeDemo(ctx, args[1:], stdout, stderr)
 	case "status":
@@ -41,6 +47,78 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		printUsage(stderr)
 		return 2
 	}
+}
+
+// executeRun 拉取 GitHub PR 的固定 Snapshot，并原子创建一个 fetched Run。
+func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("run", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
+	configPath := flags.String("config", defaultConfigPath, "runtime config path")
+	budgetCents := flags.Int64("budget-cents", 1000, "total budget in cents")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if len(flags.Args()) != 1 {
+		fmt.Fprintln(stderr, "run requires a GitHub pull request URL")
+		return 2
+	}
+	if *budgetCents <= 0 || *budgetCents > math.MaxInt64/microsPerCent {
+		fmt.Fprintln(stderr, "budget-cents must be a positive integer within range")
+		return 2
+	}
+
+	ref, err := scm.ParseGitHubPullRequestURL(flags.Args()[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "parse pull request URL: %v\n", err)
+		return 2
+	}
+	store, _, err := openStore(ctx, *dbPath, *configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "open database: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
+	if apiBaseURL == "" {
+		apiBaseURL = defaultGitHubAPI
+	}
+	adapter, err := scm.NewGitHubAdapter(nil, apiBaseURL, os.Getenv("GITHUB_TOKEN"))
+	if err != nil {
+		fmt.Fprintf(stderr, "create GitHub adapter: %v\n", err)
+		return 1
+	}
+	snapshot, err := adapter.Fetch(ctx, ref)
+	if err != nil {
+		fmt.Fprintf(stderr, "fetch pull request: %v\n", err)
+		return 1
+	}
+
+	runID, err := newRunID()
+	if err != nil {
+		fmt.Fprintf(stderr, "create run ID: %v\n", err)
+		return 1
+	}
+	now := time.Now().UTC()
+	snapshot.CreatedAt = now
+	run := domain.Run{
+		ID:                runID,
+		SourceURL:         flags.Args()[0],
+		Provider:          "github",
+		Repository:        ref.Owner + "/" + ref.Repository,
+		ChangeNumber:      ref.Number,
+		Status:            domain.RunStatusFetched,
+		BudgetLimitMicros: *budgetCents * microsPerCent,
+		CreatedAt:         now,
+		UpdatedAt:         now,
+	}
+	if err := workflow.NewService(store).StartFetched(ctx, workflow.FetchedRunRequest{Run: run, Snapshot: snapshot}); err != nil {
+		fmt.Fprintf(stderr, "create fetched run: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA)
+	return 0
 }
 
 // executeDemo 写入一个固定的离线 Run，包含不同 checkpoint 状态的 Unit。
@@ -164,16 +242,33 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 // newExecutorID 为一次 CLI 进程生成唯一的 lease owner。
 // 主机名和 PID 便于排查，随机后缀保证不同进程不会被误判为同一执行者。
 func newExecutorID() (string, error) {
-	var randomBytes [8]byte
-	if _, err := rand.Read(randomBytes[:]); err != nil {
-		return "", fmt.Errorf("read random bytes: %w", err)
+	randomSuffix, err := randomSuffix()
+	if err != nil {
+		return "", err
 	}
 
 	hostname, err := os.Hostname()
 	if err != nil || hostname == "" {
 		hostname = "unknown-host"
 	}
-	return fmt.Sprintf("cli-%s-%d-%s", hostname, os.Getpid(), hex.EncodeToString(randomBytes[:])), nil
+	return fmt.Sprintf("cli-%s-%d-%s", hostname, os.Getpid(), randomSuffix), nil
+}
+
+// newRunID 为持久化 Run 生成不会与其他命令冲突的标识。
+func newRunID() (string, error) {
+	suffix, err := randomSuffix()
+	if err != nil {
+		return "", err
+	}
+	return "run-" + suffix, nil
+}
+
+func randomSuffix() (string, error) {
+	var randomBytes [8]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
+		return "", fmt.Errorf("read random bytes: %w", err)
+	}
+	return hex.EncodeToString(randomBytes[:]), nil
 }
 
 // parseOptions 解析所有子命令共用的数据库与运行时配置参数。
@@ -226,5 +321,5 @@ func newDemoUnit(runID, id string, status domain.UnitStatus, now time.Time) doma
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: review-agent <demo|status|resume> [--db path] [--config path] [run-id]")
+	fmt.Fprintln(writer, "usage: review-agent <run|demo|status|resume> [--db path] [--config path] [run-id]")
 }

@@ -3,6 +3,9 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -108,6 +111,55 @@ func TestExecuteResumeUsesConfiguredLeaseTTL(t *testing.T) {
 	}
 	if remaining := run.LeaseExpiresAt.Sub(startedAt); remaining < time.Hour+59*time.Minute || remaining > 2*time.Hour+time.Minute {
 		t.Fatalf("lease duration = %s, want about 2h", remaining)
+	}
+}
+
+func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/acme/payments/pulls/42":
+			if got := request.Header.Get("Authorization"); got != "Bearer test-token" {
+				t.Fatalf("authorization = %q, want bearer token", got)
+			}
+			writer.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(writer, `{"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}`)
+		case "/repos/acme/payments/compare/base-sha...head-sha":
+			fmt.Fprint(writer, "diff --git a/file.go b/file.go\n")
+		default:
+			t.Fatalf("unexpected request path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_API_BASE_URL", server.URL)
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "review.db")
+	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute(ctx, []string{
+		"run", "--db", dbPath, "--config", configPath, "--budget-cents", "1000",
+		"https://github.com/acme/payments/pull/42",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run exit code = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "base_sha=base-sha") || !strings.Contains(stdout.String(), "head_sha=head-sha") {
+		t.Fatalf("run stdout = %q, want pinned SHAs", stdout.String())
+	}
+
+	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	runID := strings.TrimPrefix(strings.Split(stdout.String(), "\n")[0], "run_id=")
+	snapshot, err := store.GetSnapshot(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.BaseSHA != "base-sha" || snapshot.HeadSHA != "head-sha" {
+		t.Fatalf("snapshot = %#v", snapshot)
 	}
 }
 

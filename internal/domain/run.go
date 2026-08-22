@@ -56,3 +56,13 @@ type ReviewUnit struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
+
+// ChangeSnapshot 是一次 Review 固定下来的变更版本及其 diff。
+// 相同 Run 不允许替换 Snapshot，避免恢复时混入后来 push 的代码。
+type ChangeSnapshot struct {
+	BaseSHA    string
+	HeadSHA    string
+	Diff       string
+	DiffSHA256 string
+	CreatedAt  time.Time
+}

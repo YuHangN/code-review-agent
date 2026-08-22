@@ -26,3 +26,12 @@ CREATE TABLE IF NOT EXISTS review_units (
   updated_at TEXT NOT NULL,
   UNIQUE(run_id, unit_key)
 );
+
+CREATE TABLE IF NOT EXISTS change_snapshots (
+  run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+  base_sha TEXT NOT NULL,
+  head_sha TEXT NOT NULL,
+  diff TEXT NOT NULL,
+  diff_sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);

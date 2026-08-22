@@ -73,6 +73,40 @@ func (s *Store) CreateRun(ctx context.Context, run domain.Run, units []domain.Re
 	}
 	defer tx.Rollback()
 
+	if err := insertRun(ctx, tx, run, units); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit create run: %w", err)
+	}
+	return nil
+}
+
+// CreateRunWithSnapshot 原子写入 Run、Unit 和首次抓取的 Snapshot。
+func (s *Store) CreateRunWithSnapshot(ctx context.Context, run domain.Run, units []domain.ReviewUnit, snapshot domain.ChangeSnapshot) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin create fetched run: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := insertRun(ctx, tx, run, units); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO change_snapshots (run_id, base_sha, head_sha, diff, diff_sha256, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		run.ID, snapshot.BaseSHA, snapshot.HeadSHA, snapshot.Diff, snapshot.DiffSHA256, timeText(snapshot.CreatedAt),
+	); err != nil {
+		return fmt.Errorf("insert change snapshot: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit create fetched run: %w", err)
+	}
+	return nil
+}
+
+func insertRun(ctx context.Context, tx *sql.Tx, run domain.Run, units []domain.ReviewUnit) error {
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO runs (
 			id, source_url, provider, repository, change_number, status, budget_limit_micros,
@@ -95,9 +129,6 @@ func (s *Store) CreateRun(ctx context.Context, run domain.Run, units []domain.Re
 		); err != nil {
 			return fmt.Errorf("insert review unit: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit create run: %w", err)
 	}
 	return nil
 }
@@ -145,6 +176,38 @@ func (s *Store) ListUnits(ctx context.Context, runID string) ([]domain.ReviewUni
 		return nil, fmt.Errorf("iterate review units: %w", err)
 	}
 	return units, nil
+}
+
+// SaveSnapshot 为 Run 保存一次不可变的变更快照。
+// 数据库主键保证同一个 Run 无法替换已保存的 Snapshot。
+func (s *Store) SaveSnapshot(ctx context.Context, runID string, snapshot domain.ChangeSnapshot) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO change_snapshots (run_id, base_sha, head_sha, diff, diff_sha256, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		runID, snapshot.BaseSHA, snapshot.HeadSHA, snapshot.Diff, snapshot.DiffSHA256, timeText(snapshot.CreatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("insert change snapshot: %w", err)
+	}
+	return nil
+}
+
+// GetSnapshot 读取 Run 固定下来的变更快照。
+func (s *Store) GetSnapshot(ctx context.Context, runID string) (domain.ChangeSnapshot, error) {
+	var snapshot domain.ChangeSnapshot
+	var createdAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT base_sha, head_sha, diff, diff_sha256, created_at
+		FROM change_snapshots WHERE run_id = ?`, runID,
+	).Scan(&snapshot.BaseSHA, &snapshot.HeadSHA, &snapshot.Diff, &snapshot.DiffSHA256, &createdAt)
+	if err != nil {
+		return domain.ChangeSnapshot{}, fmt.Errorf("get change snapshot: %w", err)
+	}
+	snapshot.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return domain.ChangeSnapshot{}, fmt.Errorf("parse change snapshot created_at: %w", err)
+	}
+	return snapshot, nil
 }
 
 // ClaimRun 获取或续期 Run 的 lease；其他 owner 只能在 lease 过期后接管。
