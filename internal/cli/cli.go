@@ -14,6 +14,7 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/scm"
+	"github.com/YuHangN/code-review-agent/internal/security"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
@@ -94,6 +95,8 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "fetch pull request: %v\n", err)
 		return 1
 	}
+	sanitized := security.NewSanitizer().SanitizeSnapshot(snapshot)
+	snapshot = sanitized.Snapshot
 
 	runID, err := newRunID()
 	if err != nil {
@@ -117,7 +120,7 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "create fetched run: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA)
+	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\nredactions=%d\nexcluded_files=%d\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA, len(sanitized.Redactions), len(sanitized.ExcludedFiles))
 	return 0
 }
 

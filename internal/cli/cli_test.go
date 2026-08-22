@@ -115,6 +115,7 @@ func TestExecuteResumeUsesConfiguredLeaseTTL(t *testing.T) {
 }
 
 func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
+	const secret = "sk-live-1234567890abcdef"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/repos/acme/payments/pulls/42":
@@ -124,7 +125,7 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 			writer.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(writer, `{"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}`)
 		case "/repos/acme/payments/compare/base-sha...head-sha":
-			fmt.Fprint(writer, "diff --git a/file.go b/file.go\n")
+			fmt.Fprint(writer, "diff --git a/config.yaml b/config.yaml\n+api_key: \""+secret+"\"\n")
 		default:
 			t.Fatalf("unexpected request path: %s", request.URL.Path)
 		}
@@ -160,6 +161,12 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	}
 	if snapshot.BaseSHA != "base-sha" || snapshot.HeadSHA != "head-sha" {
 		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if strings.Contains(snapshot.Diff, secret) {
+		t.Fatalf("persisted snapshot contains secret: %q", snapshot.Diff)
+	}
+	if !strings.Contains(snapshot.Diff, "<REDACTED:API_KEY:1>") {
+		t.Fatalf("persisted snapshot = %q, want redaction placeholder", snapshot.Diff)
 	}
 }
 
