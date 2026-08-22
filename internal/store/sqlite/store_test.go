@@ -187,6 +187,142 @@ func TestStoreClaimRunRejectsOtherOwnerUntilLeaseExpires(t *testing.T) {
 	}
 }
 
+func TestStoreReleaseRunLeaseRequiresCurrentOwner(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)
+	run := domain.Run{ID: "run-release", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseRunLease(ctx, run.ID, "worker-b"); !errors.Is(err, sqlite.ErrLeaseHeld) {
+		t.Fatalf("release by other owner error = %v, want ErrLeaseHeld", err)
+	}
+	if err := store.ReleaseRunLease(ctx, run.ID, "worker-a"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LeaseOwner != "" || !got.LeaseExpiresAt.IsZero() {
+		t.Fatalf("lease after release = owner %q, expiry %v", got.LeaseOwner, got.LeaseExpiresAt)
+	}
+}
+
+func TestAdvanceRunToAggregatingRequiresTerminalUnitsAndCurrentLease(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)
+	run := domain.Run{
+		ID: "run-aggregate", SourceURL: "https://example.test/pr/1", Provider: "fake",
+		Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusReviewing,
+		BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now,
+	}
+	units := []domain.ReviewUnit{
+		{ID: "unit-completed", RunID: run.ID, UnitKey: "a", Status: domain.UnitStatusCompleted, CreatedAt: now, UpdatedAt: now},
+		{ID: "unit-pending", RunID: run.ID, UnitKey: "b", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := store.CreateRun(ctx, run, units); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.AdvanceRunToAggregating(ctx, run.ID, "worker-a", now.Add(time.Second)); !errors.Is(err, sqlite.ErrRunNotReady) {
+		t.Fatalf("advance with pending unit error = %v, want ErrRunNotReady", err)
+	}
+
+	// 创建一个只有终态 Unit 的 Run，验证成功推进和 owner 校验。
+	terminalRun := run
+	terminalRun.ID = "run-terminal"
+	terminalUnits := []domain.ReviewUnit{
+		{ID: "unit-terminal-a", RunID: terminalRun.ID, UnitKey: "a", Status: domain.UnitStatusCompleted, CreatedAt: now, UpdatedAt: now},
+		{ID: "unit-terminal-b", RunID: terminalRun.ID, UnitKey: "b", Status: domain.UnitStatusSkippedBudget, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := store.CreateRun(ctx, terminalRun, terminalUnits); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, terminalRun.ID, "worker-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceRunToAggregating(ctx, terminalRun.ID, "worker-b", now.Add(time.Second)); !errors.Is(err, sqlite.ErrLeaseHeld) {
+		t.Fatalf("advance by other owner error = %v, want ErrLeaseHeld", err)
+	}
+	if err := store.AdvanceRunToAggregating(ctx, terminalRun.ID, "worker-a", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetRun(ctx, terminalRun.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.RunStatusAggregating {
+		t.Fatalf("run status = %q, want %q", got.Status, domain.RunStatusAggregating)
+	}
+}
+
+func TestReplaceVerifiedFindingsIsAtomicAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
+	run := domain.Run{ID: "run-verified", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	unit := domain.ReviewUnit{ID: "unit-verified", RunID: run.ID, UnitKey: "a", FilePath: "config.yaml", DiffHunk: "@@ -0,0 +1 @@\n+api_key: value\n", Risk: "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartReviewUnit(ctx, unit.ID, "worker-a", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	trace := domain.ReviewTrace{ID: "trace-verified", RunID: run.ID, UnitID: unit.ID, CallID: "call-verified", Detector: "llm_review", Status: string(domain.UnitStatusCompleted), Prompt: "prompt", Response: "response", CreatedAt: now}
+	candidate := domain.CandidateFindingRecord{ID: "candidate-verified", RunID: run.ID, UnitID: unit.ID, TraceID: trace.ID, Detector: "llm_review", Category: "security", Severity: "high", File: "config.yaml", Line: 1, Title: "硬编码 secret", Explanation: "说明", Evidence: []string{"证据"}, Suggestion: "修改", CreatedAt: now}
+	if err := store.CompleteReviewUnit(ctx, trace, []domain.CandidateFindingRecord{candidate}, "worker-a", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceRunToAggregating(ctx, run.ID, "worker-a", now.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	finding := domain.VerifiedFinding{
+		ID: "finding-verified", RunID: run.ID, CandidateID: candidate.ID, TraceID: trace.ID,
+		Fingerprint: "fingerprint-verified", Confidence: domain.ConfidenceConfirmed,
+		VerificationSource: "rule:test", VerificationReason: "确定性规则命中",
+		Category: candidate.Category, Severity: candidate.Severity, File: candidate.File, Line: candidate.Line,
+		Title: candidate.Title, Explanation: candidate.Explanation, Evidence: []string{"规则证据"}, Suggestion: candidate.Suggestion, CreatedAt: now,
+	}
+
+	if err := store.ReplaceVerifiedFindings(ctx, run.ID, []domain.VerifiedFinding{finding}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReplaceVerifiedFindings(ctx, run.ID, []domain.VerifiedFinding{finding}); err != nil {
+		t.Fatalf("idempotent replacement failed: %v", err)
+	}
+	findings, err := store.ListVerifiedFindings(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].ID != finding.ID || findings[0].Confidence != domain.ConfidenceConfirmed || len(findings[0].Evidence) != 1 {
+		t.Fatalf("verified findings = %#v", findings)
+	}
+}
+
 func TestStoreClaimRunRejectsEmptyOwner(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})

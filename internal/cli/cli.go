@@ -14,10 +14,13 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/budget"
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
+	"github.com/YuHangN/code-review-agent/internal/llm"
 	"github.com/YuHangN/code-review-agent/internal/planner"
+	"github.com/YuHangN/code-review-agent/internal/review"
 	"github.com/YuHangN/code-review-agent/internal/scm"
 	"github.com/YuHangN/code-review-agent/internal/security"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
+	"github.com/YuHangN/code-review-agent/internal/verifier"
 	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
 
@@ -45,6 +48,8 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return executeStatus(ctx, args[1:], stdout, stderr)
 	case "resume":
 		return executeResume(ctx, args[1:], stdout, stderr)
+	case "trace":
+		return executeTrace(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		printUsage(stderr)
@@ -157,7 +162,7 @@ func validBudgetCents(value int64) bool {
 	return value > 0 && value <= math.MaxInt64/microsPerCent
 }
 
-// executeDemo 写入一个固定的离线 Run，包含不同 checkpoint 状态的 Unit。
+// executeDemo 使用 Fake Provider 跑通完整的离线 Review 链路，不访问网络。
 func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	dbPath, configPath, rest, ok := parseOptions("demo", args, stderr)
 	if !ok {
@@ -168,7 +173,7 @@ func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		return 2
 	}
 
-	store, _, err := openStore(ctx, dbPath, configPath)
+	store, runtime, err := openStore(ctx, dbPath, configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
 		return 1
@@ -182,16 +187,118 @@ func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		Provider:          "fake",
 		Repository:        "acme/demo",
 		ChangeNumber:      42,
-		Status:            domain.RunStatusCreated,
+		Status:            domain.RunStatusPlanned,
 		BudgetLimitMicros: 1_000_000,
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
-	if err := workflow.NewService(store).Start(ctx, workflow.StartRequest{Run: run, Units: demoUnits(run.ID, now)}); err != nil {
+	unit := domain.ReviewUnit{
+		ID: "unit-demo", RunID: run.ID, UnitKey: "internal/cache/cache.go#1-9",
+		FilePath: "internal/cache/cache.go", StartLine: 1, EndLine: 9,
+		DiffHunk: "@@ -0,0 +1,9 @@\n+package cache\n+\n+api_key := \"<REDACTED:API_KEY:1>\"\n+\n+var cache = map[string]string{}\n+\n+func Update(key, value string) {\n+\tgo func() { cache[key] = value }()\n+}\n",
+		Risk:     "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now,
+	}
+	service := workflow.NewService(store)
+	if err := service.Start(ctx, workflow.StartRequest{Run: run, Units: []domain.ReviewUnit{unit}}); err != nil {
 		fmt.Fprintf(stderr, "create demo run: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "run_id=%s\n", run.ID)
+	provider := &llm.FakeProvider{Response: llm.Response{
+		Content: `{"findings":[{"category":"security","severity":"high","file":"internal/cache/cache.go","line":3,"title":"配置中包含硬编码 API Key","explanation":"凭据不应直接写入源码","evidence":["新增 api_key 赋值"],"suggestion":"改为从环境变量或密钥服务读取"},{"category":"concurrency","severity":"high","file":"internal/cache/cache.go","line":8,"title":"共享 map 存在并发访问风险","explanation":"新增 goroutine 在没有同步保护的情况下写入包级 map，可能与其他读写并发执行","evidence":["第 5 行声明包级 map，第 8 行从 goroutine 写入"],"suggestion":"使用 mutex 保护共享 map，或改用并发安全的数据结构"}]}`,
+		Usage:   &llm.TokenUsage{InputTokens: 120, OutputTokens: 180},
+	}}
+	gateway := llm.NewGateway(
+		budget.NewManager(store), llm.ByteUpperBoundCounter{},
+		map[string]llm.Provider{"fake": provider}, runtime.LLMTiers,
+	)
+	reviewer := review.NewReviewer(gateway, runtime.DefaultLLMTier, runtime.MaxFindingsPerUnit)
+	owner, err := newExecutorID()
+	if err != nil {
+		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
+		return 1
+	}
+	executor := review.NewExecutor(store, reviewer, "llm_review", owner)
+	runner := workflow.NewRunner(service, executor)
+	result, err := runner.Run(ctx, workflow.RunRequest{
+		RunID: run.ID, Owner: owner,
+		Lease: workflow.LeaseSettings{TTL: runtime.LeaseTTL, RenewInterval: runtime.LeaseRenewInterval},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "run demo review: %v\n", err)
+		return 1
+	}
+	candidates, err := store.ListCandidateFindings(ctx, run.ID)
+	if err != nil || len(candidates) == 0 {
+		fmt.Fprintf(stderr, "read demo finding: %v\n", err)
+		return 1
+	}
+	aggregation, err := verifier.NewAggregator(store, verifier.NewDefault()).Aggregate(ctx, run.ID, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(stderr, "aggregate demo findings: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\ntrace_id=%s\n", run.ID, domain.RunStatusAggregating, result.Completed, aggregation.Confirmed, aggregation.Advisory, candidates[0].TraceID)
+	return 0
+}
+
+// executeTrace 展示一条 finding 级证据链中的 diff、Prompt、模型回复和候选问题。
+func executeTrace(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	dbPath, configPath, rest, ok := parseOptions("trace", args, stderr)
+	if !ok {
+		return 2
+	}
+	if len(rest) != 1 {
+		fmt.Fprintln(stderr, "trace requires a trace ID")
+		return 2
+	}
+	store, _, err := openStore(ctx, dbPath, configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "open database: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+
+	trace, err := store.GetReviewTrace(ctx, rest[0])
+	if err != nil {
+		fmt.Fprintf(stderr, "get trace: %v\n", err)
+		return 1
+	}
+	unit, err := store.GetReviewUnit(ctx, trace.UnitID)
+	if err != nil {
+		fmt.Fprintf(stderr, "get trace unit: %v\n", err)
+		return 1
+	}
+	findings, err := store.ListCandidateFindings(ctx, trace.RunID)
+	if err != nil {
+		fmt.Fprintf(stderr, "list trace findings: %v\n", err)
+		return 1
+	}
+	verified, err := store.ListVerifiedFindings(ctx, trace.RunID)
+	if err != nil {
+		fmt.Fprintf(stderr, "list verified findings: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "trace_id=%s\nrun_id=%s\nunit_id=%s\ndetector=%s\nstatus=%s\n", trace.ID, trace.RunID, trace.UnitID, trace.Detector, trace.Status)
+	fmt.Fprintf(stdout, "diff:\n%s\nprompt:\n%s\nresponse:\n%s\n", unit.DiffHunk, trace.Prompt, trace.Response)
+	if trace.ErrorMessage != "" {
+		fmt.Fprintf(stdout, "error=%s\n", trace.ErrorMessage)
+	}
+	for _, finding := range findings {
+		if finding.TraceID != trace.ID {
+			continue
+		}
+		fmt.Fprintf(stdout, "candidate_id=%s\nfile=%s\nline=%d\nseverity=%s\ntitle=%s\n", finding.ID, finding.File, finding.Line, finding.Severity, finding.Title)
+		fmt.Fprintf(stdout, "explanation=%s\nsuggestion=%s\n", finding.Explanation, finding.Suggestion)
+		for _, evidence := range finding.Evidence {
+			fmt.Fprintf(stdout, "evidence=%s\n", evidence)
+		}
+	}
+	for _, finding := range verified {
+		if finding.TraceID != trace.ID {
+			continue
+		}
+		fmt.Fprintf(stdout, "finding_id=%s\nconfidence=%s\nverification_source=%s\nverification_reason=%s\n", finding.ID, finding.Confidence, finding.VerificationSource, finding.VerificationReason)
+	}
 	return 0
 }
 
@@ -338,30 +445,6 @@ func openStore(ctx context.Context, dbPath, configPath string) (*sqlite.Store, c
 	return store, runtime, nil
 }
 
-// demoUnits 为离线 Demo 创建各种与恢复相关状态的 Unit。
-func demoUnits(runID string, now time.Time) []domain.ReviewUnit {
-	return []domain.ReviewUnit{
-		newDemoUnit(runID, "unit-pending", domain.UnitStatusPending, now),
-		newDemoUnit(runID, "unit-running", domain.UnitStatusRunning, now),
-		newDemoUnit(runID, "unit-retry", domain.UnitStatusFailedRecoverable, now),
-		newDemoUnit(runID, "unit-completed", domain.UnitStatusCompleted, now),
-		newDemoUnit(runID, "unit-budget", domain.UnitStatusSkippedBudget, now),
-	}
-}
-
-func newDemoUnit(runID, id string, status domain.UnitStatus, now time.Time) domain.ReviewUnit {
-	return domain.ReviewUnit{
-		ID:        id,
-		RunID:     runID,
-		UnitKey:   id,
-		FilePath:  "fixtures/demo.go",
-		Risk:      "medium",
-		Status:    status,
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-}
-
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: review-agent <run|demo|status|resume> [--db path] [--config path] [run-id]")
+	fmt.Fprintln(writer, "usage: review-agent <run|demo|status|resume|trace> [--db path] [--config path] [id]")
 }

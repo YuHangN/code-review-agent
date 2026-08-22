@@ -17,7 +17,7 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 )
 
-func TestExecuteDemoStatusAndResume(t *testing.T) {
+func TestExecuteDemoRunsOfflineReviewAndShowsTrace(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "review.db")
 	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
@@ -26,8 +26,10 @@ func TestExecuteDemoStatusAndResume(t *testing.T) {
 	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath}, &stdout, &stderr); code != 0 {
 		t.Fatalf("demo exit code = %d, stderr = %s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "run_id=demo-run") {
-		t.Fatalf("demo stdout = %q, want run ID", stdout.String())
+	for _, want := range []string{"run_id=demo-run", "status=aggregating", "completed=1", "confirmed=1", "advisory=1", "trace_id=trace-unit-demo-1"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("demo stdout = %q, want %q", stdout.String(), want)
+		}
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("demo stderr = %q, want empty", stderr.String())
@@ -37,24 +39,19 @@ func TestExecuteDemoStatusAndResume(t *testing.T) {
 	if code := cli.Execute(ctx, []string{"status", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("status exit code = %d, stderr = %s", code, stderr.String())
 	}
-	for _, want := range []string{"status=created", "units=5", "pending=1", "running=1", "failed_recoverable=1", "completed=1", "skipped_budget=1", "budget_limit_micros=1000000", "budget_reserved_micros=0", "budget_actual_micros=0", "budget_committed_micros=0"} {
+	for _, want := range []string{"status=aggregating", "units=1", "pending=0", "running=0", "failed_recoverable=0", "completed=1", "skipped_budget=0", "budget_limit_micros=1000000", "budget_reserved_micros=0"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("status stdout = %q, want %q", stdout.String(), want)
 		}
 	}
 
 	stdout.Reset()
-	if code := cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("resume exit code = %d, stderr = %s", code, stderr.String())
+	if code := cli.Execute(ctx, []string{"trace", "--db", dbPath, "--config", configPath, "trace-unit-demo-1"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("trace exit code = %d, stderr = %s", code, stderr.String())
 	}
-	for _, want := range []string{"unit-pending", "unit-retry", "unit-running"} {
+	for _, want := range []string{"trace_id=trace-unit-demo-1", "detector=llm_review", "共享 map 存在并发访问风险", "internal/cache/cache.go", "confidence=confirmed", "confidence=advisory", "diff:", "prompt:", "response:"} {
 		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("resume stdout = %q, want %q", stdout.String(), want)
-		}
-	}
-	for _, forbidden := range []string{"unit-completed", "unit-budget"} {
-		if strings.Contains(stdout.String(), forbidden) {
-			t.Fatalf("resume stdout = %q, must not contain %q", stdout.String(), forbidden)
+			t.Fatalf("trace stdout = %q, want %q", stdout.String(), want)
 		}
 	}
 }

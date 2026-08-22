@@ -15,7 +15,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var ErrUnitNotRunnable = errors.New("review unit is not runnable")
+var (
+	ErrUnitNotRunnable = errors.New("review unit is not runnable")
+	// ErrRunNotReady 表示 Run 仍有非终态 Unit，不能进入聚合阶段。
+	ErrRunNotReady = errors.New("run is not ready for aggregation")
+	// ErrRunNotAggregating 表示最终 Finding 只能在聚合阶段写入。
+	ErrRunNotAggregating = errors.New("run is not aggregating")
+)
 
 var (
 	// ErrLeaseHeld 表示当前 Run 的有效 lease 已被其他执行者持有。
@@ -300,6 +306,11 @@ func (s *Store) getReviewUnit(ctx context.Context, unitID string) (domain.Review
 	return unit, nil
 }
 
+// GetReviewUnit 返回 Trace 所关联的不可变 Unit 输入。
+func (s *Store) GetReviewUnit(ctx context.Context, unitID string) (domain.ReviewUnit, error) {
+	return s.getReviewUnit(ctx, unitID)
+}
+
 // CompleteReviewUnit 在一个事务中保存 trace、候选问题和 completed checkpoint。
 func (s *Store) CompleteReviewUnit(ctx context.Context, trace domain.ReviewTrace, findings []domain.CandidateFindingRecord, owner string, now time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -384,6 +395,62 @@ func (s *Store) FinishReviewUnit(ctx context.Context, trace domain.ReviewTrace, 
 	return nil
 }
 
+// AdvanceRunToAggregating 在当前 lease 仍有效且所有 Unit 都是终态时推进 Run。
+// completed 和 skipped_budget 都是终态；可恢复失败必须留在 reviewing 等待 resume。
+func (s *Store) AdvanceRunToAggregating(ctx context.Context, runID, owner string, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = ?
+		  AND status IN (?, ?)
+		  AND lease_owner = ?
+		  AND lease_expires_at > ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM review_units
+			WHERE run_id = runs.id AND status NOT IN (?, ?)
+		  )`,
+		domain.RunStatusAggregating, timeText(now), runID,
+		domain.RunStatusPlanned, domain.RunStatusReviewing,
+		owner, timeText(now), domain.UnitStatusCompleted, domain.UnitStatusSkippedBudget,
+	)
+	if err != nil {
+		return fmt.Errorf("advance run to aggregating: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read aggregating result: %w", err)
+	}
+	if changed == 1 {
+		return nil
+	}
+
+	var currentOwner string
+	var leaseExpiresAt sql.NullString
+	var nonTerminal int
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(lease_owner, ''), lease_expires_at,
+		       (SELECT COUNT(*) FROM review_units WHERE run_id = runs.id AND status NOT IN (?, ?))
+		FROM runs WHERE id = ?`,
+		domain.UnitStatusCompleted, domain.UnitStatusSkippedBudget, runID,
+	).Scan(&currentOwner, &leaseExpiresAt, &nonTerminal)
+	if err != nil {
+		return fmt.Errorf("read aggregating preconditions: %w", err)
+	}
+	if currentOwner != owner || !leaseExpiresAt.Valid {
+		return ErrLeaseHeld
+	}
+	expiresAt, err := parseTime(leaseExpiresAt.String)
+	if err != nil {
+		return fmt.Errorf("parse aggregating lease expiry: %w", err)
+	}
+	if !expiresAt.After(now) {
+		return ErrLeaseHeld
+	}
+	if nonTerminal > 0 {
+		return ErrRunNotReady
+	}
+	return ErrRunNotReady
+}
+
 func insertReviewTrace(ctx context.Context, tx *sql.Tx, trace domain.ReviewTrace) error {
 	rejectionsJSON, err := json.Marshal(trace.Rejections)
 	if err != nil {
@@ -461,6 +528,91 @@ func (s *Store) GetReviewTrace(ctx context.Context, traceID string) (domain.Revi
 		return domain.ReviewTrace{}, fmt.Errorf("parse trace created_at: %w", err)
 	}
 	return trace, nil
+}
+
+// ReplaceVerifiedFindings 原子替换一次 Run 的全部验证结果。
+// Verifier 是确定性的，因此恢复时可以安全重算；事务保证不会留下半批结果。
+func (s *Store) ReplaceVerifiedFindings(ctx context.Context, runID string, findings []domain.VerifiedFinding) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin replace verified findings: %w", err)
+	}
+	defer tx.Rollback()
+	var status domain.RunStatus
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&status); err != nil {
+		return fmt.Errorf("read verified finding run: %w", err)
+	}
+	if status != domain.RunStatusAggregating {
+		return ErrRunNotAggregating
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM verified_findings WHERE run_id = ?`, runID); err != nil {
+		return fmt.Errorf("delete verified findings: %w", err)
+	}
+	for _, finding := range findings {
+		if finding.RunID != runID {
+			return fmt.Errorf("verified finding %q belongs to another run", finding.ID)
+		}
+		evidenceJSON, err := json.Marshal(finding.Evidence)
+		if err != nil {
+			return fmt.Errorf("marshal verified evidence: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO verified_findings (
+				id, run_id, candidate_id, trace_id, fingerprint, confidence,
+				verification_source, verification_reason, category, severity, file_path,
+				line, title, explanation, evidence_json, suggestion, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			finding.ID, finding.RunID, finding.CandidateID, finding.TraceID, finding.Fingerprint,
+			finding.Confidence, finding.VerificationSource, finding.VerificationReason,
+			finding.Category, finding.Severity, finding.File, finding.Line, finding.Title,
+			finding.Explanation, string(evidenceJSON), finding.Suggestion, timeText(finding.CreatedAt),
+		); err != nil {
+			return fmt.Errorf("insert verified finding: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit verified findings: %w", err)
+	}
+	return nil
+}
+
+// ListVerifiedFindings 返回已分类、去重并可用于报告的最终 Finding。
+func (s *Store) ListVerifiedFindings(ctx context.Context, runID string) ([]domain.VerifiedFinding, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, candidate_id, trace_id, fingerprint, confidence,
+		       verification_source, verification_reason, category, severity, file_path,
+		       line, title, explanation, evidence_json, suggestion, created_at
+		FROM verified_findings WHERE run_id = ? ORDER BY file_path, line, id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list verified findings: %w", err)
+	}
+	defer rows.Close()
+	var findings []domain.VerifiedFinding
+	for rows.Next() {
+		var finding domain.VerifiedFinding
+		var evidenceJSON, createdAt string
+		if err := rows.Scan(
+			&finding.ID, &finding.RunID, &finding.CandidateID, &finding.TraceID,
+			&finding.Fingerprint, &finding.Confidence, &finding.VerificationSource,
+			&finding.VerificationReason, &finding.Category, &finding.Severity,
+			&finding.File, &finding.Line, &finding.Title, &finding.Explanation,
+			&evidenceJSON, &finding.Suggestion, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan verified finding: %w", err)
+		}
+		if err := json.Unmarshal([]byte(evidenceJSON), &finding.Evidence); err != nil {
+			return nil, fmt.Errorf("parse verified evidence: %w", err)
+		}
+		finding.CreatedAt, err = parseTime(createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse verified finding created_at: %w", err)
+		}
+		findings = append(findings, finding)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate verified findings: %w", err)
+	}
+	return findings, nil
 }
 
 // SaveSnapshot 为 Run 保存一次不可变的变更快照。
@@ -679,6 +831,24 @@ func (s *Store) ClaimRun(ctx context.Context, runID, owner string, now time.Time
 		return domain.Run{}, ErrLeaseHeld
 	}
 	return s.GetRun(ctx, runID)
+}
+
+// ReleaseRunLease 只允许当前 owner 主动释放 lease，避免旧进程清掉新 owner 的 lease。
+func (s *Store) ReleaseRunLease(ctx context.Context, runID, owner string) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET lease_owner = NULL, lease_expires_at = NULL
+		WHERE id = ? AND lease_owner = ?`, runID, owner)
+	if err != nil {
+		return fmt.Errorf("release run lease: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read release run lease result: %w", err)
+	}
+	if changed != 1 {
+		return ErrLeaseHeld
+	}
+	return nil
 }
 
 type rowScanner interface {

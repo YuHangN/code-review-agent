@@ -17,9 +17,13 @@ var reviewUnitInputSQL string
 //go:embed 003_review_results.sql
 var reviewResultsSQL string
 
+//go:embed 004_verified_findings.sql
+var verifiedFindingsSQL string
+
 // All 按版本号升序返回全部 migration。
 var All = []Migration{
 	{Version: 1, SQL: initialSQL},
 	{Version: 2, SQL: reviewUnitInputSQL},
 	{Version: 3, SQL: reviewResultsSQL},
+	{Version: 4, SQL: verifiedFindingsSQL},
 }

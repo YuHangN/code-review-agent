@@ -265,3 +265,11 @@ func (s *heartbeatStore) ClaimRun(_ context.Context, _ string, owner string, _ t
 func (s *heartbeatStore) ListUnits(context.Context, string) ([]domain.ReviewUnit, error) {
 	return nil, nil
 }
+
+func (s *heartbeatStore) AdvanceRunToAggregating(context.Context, string, string, time.Time) error {
+	return nil
+}
+
+func (s *heartbeatStore) ReleaseRunLease(context.Context, string, string) error {
+	return nil
+}

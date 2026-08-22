@@ -21,6 +21,8 @@ type Store interface {
 	SavePlan(ctx context.Context, runID string, units []domain.ReviewUnit, now time.Time) error
 	ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error)
 	ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error)
+	AdvanceRunToAggregating(ctx context.Context, runID, owner string, now time.Time) error
+	ReleaseRunLease(ctx context.Context, runID, owner string) error
 }
 
 // Service 编排可恢复的 Run 操作，不依赖具体的 SQLite 实现。
@@ -119,6 +121,25 @@ func (s Service) Resume(ctx context.Context, runID, owner string, now time.Time,
 		}
 	}
 	return result, nil
+}
+
+// AdvanceToAggregating 仅在全部 Unit 已完成或因预算跳过时推进 Run。
+func (s Service) AdvanceToAggregating(ctx context.Context, runID, owner string, now time.Time) error {
+	if runID == "" {
+		return ErrRunIDRequired
+	}
+	if err := s.store.AdvanceRunToAggregating(ctx, runID, owner, now); err != nil {
+		return fmt.Errorf("advance run to aggregating: %w", err)
+	}
+	return nil
+}
+
+// ReleaseLease 在一次调度结束后释放当前进程持有的 lease。
+func (s Service) ReleaseLease(ctx context.Context, runID, owner string) error {
+	if err := s.store.ReleaseRunLease(ctx, runID, owner); err != nil {
+		return fmt.Errorf("release run lease: %w", err)
+	}
+	return nil
 }
 
 // isResumable 排除 completed 和 skipped_budget Unit，避免恢复时重复处理。
