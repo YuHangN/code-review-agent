@@ -1,0 +1,23 @@
+# Local planning files
+/task_plan.md
+/findings.md
+/progress.md
+
+# Runtime data
+/.review-agent/
+/out/
+*.db
+*.db-shm
+*.db-wal
+
+# Local credentials and editor files
+.env
+.DS_Store
+.idea/
+.vscode/
+
+# Build output
+/review-agent
+/bin/
+
+/docs
