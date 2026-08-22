@@ -323,6 +323,42 @@ func TestReplaceVerifiedFindingsIsAtomicAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestSaveReportCheckpointsContentAndMarksRunReported(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Date(2026, 8, 23, 2, 0, 0, 0, time.UTC)
+	run := domain.Run{ID: "run-report", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusAggregating, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	report := domain.Report{RunID: run.ID, OutputPath: "out/report.md", Content: "# Report\n", ContentSHA256: "sha256-value", CreatedAt: now}
+
+	if err := store.SaveReport(ctx, report, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveReport(ctx, report, now.Add(time.Second)); err != nil {
+		t.Fatalf("idempotent report checkpoint failed: %v", err)
+	}
+	got, err := store.GetReport(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != report {
+		t.Fatalf("stored report = %#v, want %#v", got, report)
+	}
+	gotRun, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRun.Status != domain.RunStatusReported {
+		t.Fatalf("run status = %q, want %q", gotRun.Status, domain.RunStatusReported)
+	}
+}
+
 func TestStoreClaimRunRejectsEmptyOwner(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})

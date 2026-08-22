@@ -20,15 +20,25 @@ import (
 func TestExecuteDemoRunsOfflineReviewAndShowsTrace(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "review.db")
+	reportPath := filepath.Join(t.TempDir(), "report.md")
 	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
 
 	var stdout, stderr bytes.Buffer
-	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath}, &stdout, &stderr); code != 0 {
+	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath, "--output", reportPath}, &stdout, &stderr); code != 0 {
 		t.Fatalf("demo exit code = %d, stderr = %s", code, stderr.String())
 	}
-	for _, want := range []string{"run_id=demo-run", "status=aggregating", "completed=1", "confirmed=1", "advisory=1", "trace_id=trace-unit-demo-1"} {
+	for _, want := range []string{"run_id=demo-run", "status=reported", "completed=1", "confirmed=1", "advisory=1", "trace_id=trace-unit-demo-1", "report_path=" + reportPath} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("demo stdout = %q, want %q", stdout.String(), want)
+		}
+	}
+	reportContent, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"# Code Review Report", "## 高置信度，可直接采纳（1）", "## 仅供参考（1）", "trace-unit-demo-1"} {
+		if !strings.Contains(string(reportContent), want) {
+			t.Fatalf("report does not contain %q:\n%s", want, reportContent)
 		}
 	}
 	if stderr.Len() != 0 {
@@ -39,7 +49,7 @@ func TestExecuteDemoRunsOfflineReviewAndShowsTrace(t *testing.T) {
 	if code := cli.Execute(ctx, []string{"status", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("status exit code = %d, stderr = %s", code, stderr.String())
 	}
-	for _, want := range []string{"status=aggregating", "units=1", "pending=0", "running=0", "failed_recoverable=0", "completed=1", "skipped_budget=0", "budget_limit_micros=1000000", "budget_reserved_micros=0"} {
+	for _, want := range []string{"status=reported", "units=1", "pending=0", "running=0", "failed_recoverable=0", "completed=1", "skipped_budget=0", "budget_limit_micros=1000000", "budget_reserved_micros=0"} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("status stdout = %q, want %q", stdout.String(), want)
 		}
@@ -54,6 +64,22 @@ func TestExecuteDemoRunsOfflineReviewAndShowsTrace(t *testing.T) {
 			t.Fatalf("trace stdout = %q, want %q", stdout.String(), want)
 		}
 	}
+
+	restoredPath := filepath.Join(t.TempDir(), "restored.md")
+	stdout.Reset()
+	if code := cli.Execute(ctx, []string{"report", "--db", dbPath, "--config", configPath, "--output", restoredPath, "demo-run"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("report exit code = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "reused=true") || !strings.Contains(stdout.String(), "report_path="+restoredPath) {
+		t.Fatalf("report stdout = %q", stdout.String())
+	}
+	restored, err := os.ReadFile(restoredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != string(reportContent) {
+		t.Fatal("restored report differs from checkpoint")
+	}
 }
 
 func TestExecuteResumeRejectsSecondCLIProcessWhileLeaseIsValid(t *testing.T) {
@@ -62,7 +88,7 @@ func TestExecuteResumeRejectsSecondCLIProcessWhileLeaseIsValid(t *testing.T) {
 	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
 
 	var stdout, stderr bytes.Buffer
-	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath}, &stdout, &stderr); code != 0 {
+	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath, "--output", filepath.Join(t.TempDir(), "report.md")}, &stdout, &stderr); code != 0 {
 		t.Fatalf("demo exit code = %d, stderr = %s", code, stderr.String())
 	}
 
@@ -88,7 +114,7 @@ func TestExecuteResumeUsesConfiguredLeaseTTL(t *testing.T) {
 	configPath := writeRuntimeConfig(t, "2h", "30m", "50ms")
 
 	var stdout, stderr bytes.Buffer
-	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath}, &stdout, &stderr); code != 0 {
+	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath, "--output", filepath.Join(t.TempDir(), "report.md")}, &stdout, &stderr); code != 0 {
 		t.Fatalf("demo exit code = %d, stderr = %s", code, stderr.String())
 	}
 	stdout.Reset()

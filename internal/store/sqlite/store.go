@@ -21,6 +21,8 @@ var (
 	ErrRunNotReady = errors.New("run is not ready for aggregation")
 	// ErrRunNotAggregating 表示最终 Finding 只能在聚合阶段写入。
 	ErrRunNotAggregating = errors.New("run is not aggregating")
+	// ErrRunNotReportable 表示只有 aggregating/reported Run 可以保存报告。
+	ErrRunNotReportable = errors.New("run is not reportable")
 )
 
 var (
@@ -613,6 +615,73 @@ func (s *Store) ListVerifiedFindings(ctx context.Context, runID string) ([]domai
 		return nil, fmt.Errorf("iterate verified findings: %w", err)
 	}
 	return findings, nil
+}
+
+// SaveReport 原子保存权威 Markdown，并将 Run 推进到 reported。
+// reported 状态允许重复写入相同产物，支持文件丢失后的恢复。
+func (s *Store) SaveReport(ctx context.Context, report domain.Report, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save report: %w", err)
+	}
+	defer tx.Rollback()
+	var status domain.RunStatus
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, report.RunID).Scan(&status); err != nil {
+		return fmt.Errorf("read report run: %w", err)
+	}
+	if status != domain.RunStatusAggregating && status != domain.RunStatusReported {
+		return ErrRunNotReportable
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO reports (run_id, output_path, content, content_sha256, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(run_id) DO UPDATE SET
+		  output_path = excluded.output_path,
+		  content = excluded.content,
+		  content_sha256 = excluded.content_sha256,
+		  created_at = excluded.created_at`,
+		report.RunID, report.OutputPath, report.Content, report.ContentSHA256, timeText(report.CreatedAt),
+	); err != nil {
+		return fmt.Errorf("upsert report: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = ? AND status IN (?, ?)`,
+		domain.RunStatusReported, timeText(now), report.RunID,
+		domain.RunStatusAggregating, domain.RunStatusReported,
+	)
+	if err != nil {
+		return fmt.Errorf("mark run reported: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read reported result: %w", err)
+	}
+	if changed != 1 {
+		return ErrRunNotReportable
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit report: %w", err)
+	}
+	return nil
+}
+
+// GetReport 返回 Run 已持久化的权威 Markdown 产物。
+func (s *Store) GetReport(ctx context.Context, runID string) (domain.Report, error) {
+	var report domain.Report
+	var createdAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT run_id, output_path, content, content_sha256, created_at
+		FROM reports WHERE run_id = ?`, runID,
+	).Scan(&report.RunID, &report.OutputPath, &report.Content, &report.ContentSHA256, &createdAt)
+	if err != nil {
+		return domain.Report{}, fmt.Errorf("get report: %w", err)
+	}
+	report.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return domain.Report{}, fmt.Errorf("parse report created_at: %w", err)
+	}
+	return report, nil
 }
 
 // SaveSnapshot 为 Run 保存一次不可变的变更快照。

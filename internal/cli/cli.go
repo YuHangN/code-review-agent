@@ -3,12 +3,14 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/budget"
@@ -16,6 +18,7 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/llm"
 	"github.com/YuHangN/code-review-agent/internal/planner"
+	"github.com/YuHangN/code-review-agent/internal/report"
 	"github.com/YuHangN/code-review-agent/internal/review"
 	"github.com/YuHangN/code-review-agent/internal/scm"
 	"github.com/YuHangN/code-review-agent/internal/security"
@@ -50,6 +53,8 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return executeResume(ctx, args[1:], stdout, stderr)
 	case "trace":
 		return executeTrace(ctx, args[1:], stdout, stderr)
+	case "report":
+		return executeReport(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		printUsage(stderr)
@@ -164,16 +169,20 @@ func validBudgetCents(value int64) bool {
 
 // executeDemo 使用 Fake Provider 跑通完整的离线 Review 链路，不访问网络。
 func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	dbPath, configPath, rest, ok := parseOptions("demo", args, stderr)
-	if !ok {
+	flags := flag.NewFlagSet("demo", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
+	configPath := flags.String("config", defaultConfigPath, "runtime config path")
+	outputPath := flags.String("output", filepath.Join("out", "demo-report.md"), "Markdown report output path")
+	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	if len(rest) != 0 {
+	if len(flags.Args()) != 0 {
 		fmt.Fprintln(stderr, "demo does not accept positional arguments")
 		return 2
 	}
 
-	store, runtime, err := openStore(ctx, dbPath, configPath)
+	store, runtime, err := openStore(ctx, *dbPath, *configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
 		return 1
@@ -187,7 +196,7 @@ func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		Provider:          "fake",
 		Repository:        "acme/demo",
 		ChangeNumber:      42,
-		Status:            domain.RunStatusPlanned,
+		Status:            domain.RunStatusFetched,
 		BudgetLimitMicros: 1_000_000,
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -198,9 +207,18 @@ func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		DiffHunk: "@@ -0,0 +1,9 @@\n+package cache\n+\n+api_key := \"<REDACTED:API_KEY:1>\"\n+\n+var cache = map[string]string{}\n+\n+func Update(key, value string) {\n+\tgo func() { cache[key] = value }()\n+}\n",
 		Risk:     "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now,
 	}
+	diffHash := sha256.Sum256([]byte(unit.DiffHunk))
+	snapshot := domain.ChangeSnapshot{
+		BaseSHA: "demo-base-sha", HeadSHA: "demo-head-sha", Diff: unit.DiffHunk,
+		DiffSHA256: fmt.Sprintf("%x", diffHash[:]), CreatedAt: now,
+	}
 	service := workflow.NewService(store)
-	if err := service.Start(ctx, workflow.StartRequest{Run: run, Units: []domain.ReviewUnit{unit}}); err != nil {
+	if err := service.StartFetched(ctx, workflow.FetchedRunRequest{Run: run, Snapshot: snapshot}); err != nil {
 		fmt.Fprintf(stderr, "create demo run: %v\n", err)
+		return 1
+	}
+	if err := service.SavePlan(ctx, run.ID, []domain.ReviewUnit{unit}, now); err != nil {
+		fmt.Fprintf(stderr, "save demo plan: %v\n", err)
 		return 1
 	}
 	provider := &llm.FakeProvider{Response: llm.Response{
@@ -237,7 +255,45 @@ func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintf(stderr, "aggregate demo findings: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\ntrace_id=%s\n", run.ID, domain.RunStatusAggregating, result.Completed, aggregation.Confirmed, aggregation.Advisory, candidates[0].TraceID)
+	reportResult, err := report.NewGenerator(store).Generate(ctx, report.GenerateRequest{RunID: run.ID, OutputPath: *outputPath, Now: time.Now().UTC()})
+	if err != nil {
+		fmt.Fprintf(stderr, "generate demo report: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\ntrace_id=%s\nreport_path=%s\n", run.ID, domain.RunStatusReported, result.Completed, aggregation.Confirmed, aggregation.Advisory, candidates[0].TraceID, reportResult.Report.OutputPath)
+	return 0
+}
+
+// executeReport 为 aggregating Run 生成报告，或从 reported checkpoint 恢复报告文件。
+func executeReport(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("report", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
+	configPath := flags.String("config", defaultConfigPath, "runtime config path")
+	outputPath := flags.String("output", "", "Markdown report output path")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+	if len(flags.Args()) != 1 {
+		fmt.Fprintln(stderr, "report requires a run ID")
+		return 2
+	}
+	runID := flags.Args()[0]
+	if *outputPath == "" {
+		*outputPath = filepath.Join("out", runID+".md")
+	}
+	store, _, err := openStore(ctx, *dbPath, *configPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "open database: %v\n", err)
+		return 1
+	}
+	defer store.Close()
+	result, err := report.NewGenerator(store).Generate(ctx, report.GenerateRequest{RunID: runID, OutputPath: *outputPath, Now: time.Now().UTC()})
+	if err != nil {
+		fmt.Fprintf(stderr, "generate report: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\nreport_path=%s\ncontent_sha256=%s\nreused=%t\n", runID, domain.RunStatusReported, result.Report.OutputPath, result.Report.ContentSHA256, result.Reused)
 	return 0
 }
 
@@ -446,5 +502,5 @@ func openStore(ctx context.Context, dbPath, configPath string) (*sqlite.Store, c
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: review-agent <run|demo|status|resume|trace> [--db path] [--config path] [id]")
+	fmt.Fprintln(writer, "usage: review-agent <run|demo|status|resume|trace|report> [--db path] [--config path] [id]")
 }
