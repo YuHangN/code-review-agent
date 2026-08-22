@@ -26,3 +26,24 @@ review-agent demo
 - **安全边界**：Secret Scanner 在模型调用和内容落盘前运行；首版不执行用户仓库中的构建或测试脚本。
 - **可扩展工具**：工具通过统一接口和 YAML 注册，新增工具不修改 Review Workflow。
 - **平台适配**：主流程处理统一的变更快照，GitHub/GitLab 差异留在各自 Adapter 中；首版实现 GitHub。
+
+## 项目结构
+
+当前已搭好目录骨架，业务实现会按模块逐步补齐：
+
+```text
+cmd/review-agent/          CLI 入口
+internal/
+  domain/                  核心领域模型
+  workflow/                Review 状态机与恢复编排
+  scm/                     GitHub、GitLab 和 Fake Adapter
+  snapshot/ security/      Snapshot 与脱敏边界
+  policy/ tools/ model/    策略、工具与模型网关
+  budget/ review/ trace/   预算、Finding 与可观测性
+  report/ store/sqlite/    Markdown 输出与本地持久化
+config/                    Policy 和规则配置
+prompts/                   版本化 Review / Verify Prompt
+fixtures/                  离线 Demo 和测试数据
+migrations/ scripts/       数据库迁移与演示脚本
+docker/ examples/          容器和示例产物
+```
