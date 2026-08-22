@@ -5,3 +5,12 @@ runtime:
 review:
   default_budget_cents: 1000
   currency: USD
+llm:
+  default_tier: economy
+  tiers:
+    economy:
+      provider: fake
+      model: fake-reviewer
+      input_price_micros_per_million_tokens: 2000000
+      output_price_micros_per_million_tokens: 4000000
+      max_output_tokens: 1200

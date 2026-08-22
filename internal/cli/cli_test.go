@@ -231,7 +231,16 @@ func writeRuntimeConfig(t *testing.T, ttl, interval, busyTimeout string) string 
 		"  sqlite_busy_timeout: " + busyTimeout + "\n" +
 		"review:\n" +
 		"  default_budget_cents: 750\n" +
-		"  currency: USD\n"
+		"  currency: USD\n" +
+		"llm:\n" +
+		"  default_tier: economy\n" +
+		"  tiers:\n" +
+		"    economy:\n" +
+		"      provider: fake\n" +
+		"      model: fake-reviewer\n" +
+		"      input_price_micros_per_million_tokens: 2000000\n" +
+		"      output_price_micros_per_million_tokens: 4000000\n" +
+		"      max_output_tokens: 1200\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

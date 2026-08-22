@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/llm"
 	"gopkg.in/yaml.v3"
 )
 
@@ -17,6 +18,16 @@ type Runtime struct {
 	SQLiteBusyTimeout  time.Duration
 	DefaultBudgetCents int64
 	Currency           string
+	DefaultLLMTier     string
+	LLMTiers           map[string]llm.Tier
+}
+
+type rawLLMTier struct {
+	Provider                          string `yaml:"provider"`
+	Model                             string `yaml:"model"`
+	InputPriceMicrosPerMillionTokens  int64  `yaml:"input_price_micros_per_million_tokens"`
+	OutputPriceMicrosPerMillionTokens int64  `yaml:"output_price_micros_per_million_tokens"`
+	MaxOutputTokens                   int64  `yaml:"max_output_tokens"`
 }
 
 // LoadRuntime 从 YAML 文件读取并校验运行时配置。
@@ -36,19 +47,33 @@ func LoadRuntime(path string) (Runtime, error) {
 			DefaultBudgetCents int64  `yaml:"default_budget_cents"`
 			Currency           string `yaml:"currency"`
 		} `yaml:"review"`
+		LLM struct {
+			DefaultTier string                `yaml:"default_tier"`
+			Tiers       map[string]rawLLMTier `yaml:"tiers"`
+		} `yaml:"llm"`
 	}
 	if err := yaml.Unmarshal(content, &raw); err != nil {
 		return Runtime{}, fmt.Errorf("parse runtime config: %w", err)
 	}
 
-	runtime, err := parseRuntime(raw.Runtime.LeaseTTL, raw.Runtime.LeaseRenewInterval, raw.Runtime.SQLiteBusyTimeout, raw.Review.DefaultBudgetCents, raw.Review.Currency)
+	tiers := make(map[string]llm.Tier, len(raw.LLM.Tiers))
+	for name, tier := range raw.LLM.Tiers {
+		tiers[name] = llm.Tier{
+			Provider:                    tier.Provider,
+			Model:                       tier.Model,
+			InputPriceMicrosPerMillion:  tier.InputPriceMicrosPerMillionTokens,
+			OutputPriceMicrosPerMillion: tier.OutputPriceMicrosPerMillionTokens,
+			MaxOutputTokens:             tier.MaxOutputTokens,
+		}
+	}
+	runtime, err := parseRuntime(raw.Runtime.LeaseTTL, raw.Runtime.LeaseRenewInterval, raw.Runtime.SQLiteBusyTimeout, raw.Review.DefaultBudgetCents, raw.Review.Currency, raw.LLM.DefaultTier, tiers)
 	if err != nil {
 		return Runtime{}, fmt.Errorf("validate runtime config: %w", err)
 	}
 	return runtime, nil
 }
 
-func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaultBudgetCents int64, currency string) (Runtime, error) {
+func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaultBudgetCents int64, currency, defaultLLMTier string, tiers map[string]llm.Tier) (Runtime, error) {
 	ttl, err := time.ParseDuration(leaseTTL)
 	if err != nil || ttl <= 0 {
 		return Runtime{}, fmt.Errorf("lease_ttl must be a positive duration")
@@ -68,6 +93,18 @@ func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaul
 	if currency != "USD" {
 		return Runtime{}, fmt.Errorf("currency must be USD")
 	}
+	defaultLLMTier = strings.TrimSpace(defaultLLMTier)
+	if defaultLLMTier == "" {
+		return Runtime{}, fmt.Errorf("llm.default_tier must not be empty")
+	}
+	if _, ok := tiers[defaultLLMTier]; !ok {
+		return Runtime{}, fmt.Errorf("llm.default_tier %q is not configured", defaultLLMTier)
+	}
+	for name, tier := range tiers {
+		if strings.TrimSpace(name) == "" || strings.TrimSpace(tier.Provider) == "" || strings.TrimSpace(tier.Model) == "" || tier.InputPriceMicrosPerMillion <= 0 || tier.OutputPriceMicrosPerMillion <= 0 || tier.MaxOutputTokens <= 0 {
+			return Runtime{}, fmt.Errorf("llm tier %q is invalid", name)
+		}
+	}
 
 	return Runtime{
 		LeaseTTL:           ttl,
@@ -75,5 +112,7 @@ func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaul
 		SQLiteBusyTimeout:  busyTimeout,
 		DefaultBudgetCents: defaultBudgetCents,
 		Currency:           currency,
+		DefaultLLMTier:     defaultLLMTier,
+		LLMTiers:           tiers,
 	}, nil
 }

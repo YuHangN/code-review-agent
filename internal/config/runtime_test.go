@@ -16,6 +16,15 @@ func TestLoadRuntimeParsesAndValidatesDurations(t *testing.T) {
 review:
   default_budget_cents: 750
   currency: USD
+llm:
+  default_tier: economy
+  tiers:
+    economy:
+      provider: fake
+      model: fake-reviewer
+      input_price_micros_per_million_tokens: 2000000
+      output_price_micros_per_million_tokens: 4000000
+      max_output_tokens: 1200
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -35,6 +44,13 @@ review:
 	}
 	if runtime.DefaultBudgetCents != 750 || runtime.Currency != "USD" {
 		t.Fatalf("default budget = %d %s, want 750 USD cents", runtime.DefaultBudgetCents, runtime.Currency)
+	}
+	if runtime.DefaultLLMTier != "economy" {
+		t.Fatalf("default LLM tier = %q, want economy", runtime.DefaultLLMTier)
+	}
+	tier := runtime.LLMTiers["economy"]
+	if tier.Provider != "fake" || tier.Model != "fake-reviewer" || tier.MaxOutputTokens != 1200 {
+		t.Fatalf("economy tier = %#v", tier)
 	}
 }
 
@@ -71,5 +87,32 @@ review:
 
 	if _, err := LoadRuntime(path); err == nil {
 		t.Fatal("LoadRuntime succeeded, want unsupported currency error")
+	}
+}
+
+func TestLoadRuntimeRejectsUnknownDefaultLLMTier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.yaml")
+	if err := os.WriteFile(path, []byte(`runtime:
+  lease_ttl: 60s
+  lease_renew_interval: 20s
+  sqlite_busy_timeout: 5s
+review:
+  default_budget_cents: 1000
+  currency: USD
+llm:
+  default_tier: strong
+  tiers:
+    economy:
+      provider: fake
+      model: fake-reviewer
+      input_price_micros_per_million_tokens: 2000000
+      output_price_micros_per_million_tokens: 4000000
+      max_output_tokens: 1200
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadRuntime(path); err == nil {
+		t.Fatal("LoadRuntime succeeded, want unknown default tier error")
 	}
 }
