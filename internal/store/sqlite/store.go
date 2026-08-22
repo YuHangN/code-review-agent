@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/domain"
@@ -12,12 +13,20 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var ErrLeaseHeld = errors.New("run lease is held by another owner")
+var (
+	// ErrLeaseHeld 表示当前 Run 的有效 lease 已被其他执行者持有。
+	ErrLeaseHeld = errors.New("run lease is held by another owner")
+	// ErrLeaseOwnerRequired 表示领取 lease 时缺少唯一执行者标识。
+	ErrLeaseOwnerRequired = errors.New("lease owner is required")
+)
 
+// Store 将 Review 状态持久化到本地 SQLite。
 type Store struct {
 	db *sql.DB
 }
 
+// Open 配置 SQLite 的并发与持久化选项，并执行初始 schema migration。
+// DSN 中的 pragma 会应用到 database/sql 新建的每条物理连接。
 func Open(ctx context.Context, path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
@@ -42,10 +51,13 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	return store, nil
 }
 
+// Close 释放数据库连接池。
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// CreateRun 原子写入一个 Run 及其全部 Review Unit。
+// 任一 Unit 写入失败时，Run 和所有 Unit 都不会提交。
 func (s *Store) CreateRun(ctx context.Context, run domain.Run, units []domain.ReviewUnit) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -82,6 +94,7 @@ func (s *Store) CreateRun(ctx context.Context, run domain.Run, units []domain.Re
 	return nil
 }
 
+// GetRun 读取一个 Run 的持久化状态和当前 lease。
 func (s *Store) GetRun(ctx context.Context, id string) (domain.Run, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, source_url, provider, repository, change_number, status, budget_limit_micros,
@@ -90,6 +103,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (domain.Run, error) {
 	return scanRun(row)
 }
 
+// ListUnits 按稳定的 unit key 顺序返回 Run 的 Unit，保证恢复结果可预测。
 func (s *Store) ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, run_id, unit_key, file_path, risk, status, attempt, created_at, updated_at
@@ -125,13 +139,17 @@ func (s *Store) ListUnits(ctx context.Context, runID string) ([]domain.ReviewUni
 	return units, nil
 }
 
+// ClaimRun 获取或续期 Run 的 lease；其他 owner 只能在 lease 过期后接管。
 func (s *Store) ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error) {
+	if strings.TrimSpace(owner) == "" {
+		return domain.Run{}, ErrLeaseOwnerRequired
+	}
 	expiresAt := now.Add(ttl)
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE runs
 		SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
 		WHERE id = ?
-		  AND (lease_owner IS NULL OR lease_owner = '' OR lease_expires_at IS NULL OR lease_expires_at <= ? OR lease_owner = ?)`,
+		  AND (lease_owner IS NULL OR lease_expires_at <= ? OR lease_owner = ?)`,
 		owner, timeText(expiresAt), timeText(now), runID, timeText(now), owner,
 	)
 	if err != nil {

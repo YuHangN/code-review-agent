@@ -2,7 +2,7 @@ package migrations
 
 import _ "embed"
 
-// SQL contains the initial database schema.
+// SQL 包含初始数据库 schema。
 //
 //go:embed 001_init.sql
 var SQL string

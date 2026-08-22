@@ -2,6 +2,7 @@ package domain
 
 import "time"
 
+// RunStatus 表示一次 Review 在持久化状态机中的阶段。
 type RunStatus string
 
 const (
@@ -16,6 +17,7 @@ const (
 	RunStatusPublished   RunStatus = "published"
 )
 
+// UnitStatus 表示一个可独立恢复的 Review Unit 是否仍需处理。
 type UnitStatus string
 
 const (
@@ -26,6 +28,7 @@ const (
 	UnitStatusSkippedBudget     UnitStatus = "skipped_budget"
 )
 
+// Run 保存一次 PR/MR Review 的身份、状态和执行 lease。
 type Run struct {
 	ID                string
 	SourceURL         string
@@ -40,6 +43,8 @@ type Run struct {
 	UpdatedAt         time.Time
 }
 
+// ReviewUnit 是一次 Review 中最小的 checkpoint 单元。
+// 恢复时会复用 completed Unit，不会再次审查。
 type ReviewUnit struct {
 	ID        string
 	RunID     string

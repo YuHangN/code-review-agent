@@ -130,3 +130,31 @@ func TestStoreClaimRunRejectsOtherOwnerUntilLeaseExpires(t *testing.T) {
 		t.Fatalf("lease owner = %q, want %q", claimed.LeaseOwner, "worker-b")
 	}
 }
+
+func TestStoreClaimRunRejectsEmptyOwner(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.CreateRun(ctx, domain.Run{
+		ID:                "run-001",
+		SourceURL:         "https://example.test/org/repository/changes/1",
+		Provider:          "github",
+		Repository:        "org/repository",
+		ChangeNumber:      1,
+		Status:            domain.RunStatusCreated,
+		BudgetLimitMicros: 1_000_000,
+		CreatedAt:         time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:         time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.ClaimRun(ctx, "run-001", "", time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC), time.Minute)
+	if !errors.Is(err, sqlite.ErrLeaseOwnerRequired) {
+		t.Fatalf("ClaimRun with empty owner error = %v, want ErrLeaseOwnerRequired", err)
+	}
+}
