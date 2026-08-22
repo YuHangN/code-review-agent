@@ -1,0 +1,28 @@
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS runs (
+  id TEXT PRIMARY KEY,
+  source_url TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  repository TEXT NOT NULL,
+  change_number INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  budget_limit_micros INTEGER NOT NULL,
+  lease_owner TEXT,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review_units (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  unit_key TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(run_id, unit_key)
+);

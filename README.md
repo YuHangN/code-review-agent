@@ -17,6 +17,14 @@ review-agent trace <trace-id>
 review-agent demo
 ```
 
+- `run`：创建一次 Review，默认只生成 Markdown 报告。
+- `resume`：从 SQLite checkpoint 继续中断的 Run。
+- `status`：查看当前进度、预算和失败原因。
+- `trace`：查看某条 Finding 使用的 diff、工具和模型证据。
+- `demo`：离线运行固定 fixture，用于演示和测试。
+
+以上命令正在实现中；当前仓库只有项目骨架。
+
 ## 设计重点
 
 - **可恢复**：Run 和 Review Unit 保存到 SQLite，重启后复用已经完成的工具和模型结果。
@@ -26,6 +34,24 @@ review-agent demo
 - **安全边界**：Secret Scanner 在模型调用和内容落盘前运行；首版不执行用户仓库中的构建或测试脚本。
 - **可扩展工具**：工具通过统一接口和 YAML 注册，新增工具不修改 Review Workflow。
 - **平台适配**：主流程处理统一的变更快照，GitHub/GitLab 差异留在各自 Adapter 中；首版实现 GitHub。
+
+## Review 工作流
+
+```text
+PR URL
+  → 创建可恢复的 Run
+  → 获取并固定 base/head SHA Snapshot
+  → 脱敏、切分并按风险排序 Review Unit
+  → 工具提供确定性证据，模型提出候选问题
+  → Verifier 分类为 confirmed / advisory，并写入 Trace
+  → 保存 checkpoint 和预算账本
+  → 生成 Markdown；显式 publish 后才回评 PR
+```
+
+- **Workflow** 管理任务状态、恢复和步骤顺序。
+- **Reviewer** 负责发现候选问题，不直接发布评论。
+- **Verifier** 用规则和工具证据决定问题是否为高置信度。
+- 每个 Unit 独立持久化；中断后只继续未完成部分。
 
 ## 项目结构
 
