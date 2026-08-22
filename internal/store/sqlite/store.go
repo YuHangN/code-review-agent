@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +14,8 @@ import (
 	"github.com/YuHangN/code-review-agent/migrations"
 	_ "modernc.org/sqlite"
 )
+
+var ErrUnitNotRunnable = errors.New("review unit is not runnable")
 
 var (
 	// ErrLeaseHeld 表示当前 Run 的有效 lease 已被其他执行者持有。
@@ -48,10 +51,35 @@ func Open(ctx context.Context, path string, options Options) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("begin migration: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, migrations.SQL); err != nil {
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
 		_ = tx.Rollback()
 		_ = db.Close()
-		return nil, fmt.Errorf("run migration: %w", err)
+		return nil, fmt.Errorf("create migration ledger: %w", err)
+	}
+	for _, migration := range migrations.All {
+		var applied int
+		err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = ?`, migration.Version).Scan(&applied)
+		if err != nil {
+			_ = tx.Rollback()
+			_ = db.Close()
+			return nil, fmt.Errorf("check migration %d: %w", migration.Version, err)
+		}
+		if applied != 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, migration.SQL); err != nil {
+			_ = tx.Rollback()
+			_ = db.Close()
+			return nil, fmt.Errorf("run migration %d: %w", migration.Version, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`, migration.Version, timeText(time.Now().UTC())); err != nil {
+			_ = tx.Rollback()
+			_ = db.Close()
+			return nil, fmt.Errorf("record migration %d: %w", migration.Version, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		_ = db.Close()
@@ -123,9 +151,10 @@ func insertRun(ctx context.Context, tx *sql.Tx, run domain.Run, units []domain.R
 	for _, unit := range units {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO review_units (
-				id, run_id, unit_key, file_path, risk, status, attempt, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			unit.ID, unit.RunID, unit.UnitKey, unit.FilePath, unit.Risk, unit.Status,
+				id, run_id, unit_key, file_path, start_line, end_line, diff_hunk,
+				risk, status, attempt, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			unit.ID, unit.RunID, unit.UnitKey, unit.FilePath, unit.StartLine, unit.EndLine, unit.DiffHunk, unit.Risk, unit.Status,
 			unit.Attempt, timeText(unit.CreatedAt), timeText(unit.UpdatedAt),
 		); err != nil {
 			return fmt.Errorf("insert review unit: %w", err)
@@ -146,7 +175,8 @@ func (s *Store) GetRun(ctx context.Context, id string) (domain.Run, error) {
 // ListUnits 按稳定的 unit key 顺序返回 Run 的 Unit，保证恢复结果可预测。
 func (s *Store) ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, run_id, unit_key, file_path, risk, status, attempt, created_at, updated_at
+		SELECT id, run_id, unit_key, file_path, start_line, end_line, diff_hunk,
+		       risk, status, attempt, created_at, updated_at
 		FROM review_units WHERE run_id = ? ORDER BY unit_key`, runID)
 	if err != nil {
 		return nil, fmt.Errorf("list review units: %w", err)
@@ -158,7 +188,7 @@ func (s *Store) ListUnits(ctx context.Context, runID string) ([]domain.ReviewUni
 		var unit domain.ReviewUnit
 		var createdAt, updatedAt string
 		if err := rows.Scan(
-			&unit.ID, &unit.RunID, &unit.UnitKey, &unit.FilePath, &unit.Risk,
+			&unit.ID, &unit.RunID, &unit.UnitKey, &unit.FilePath, &unit.StartLine, &unit.EndLine, &unit.DiffHunk, &unit.Risk,
 			&unit.Status, &unit.Attempt, &createdAt, &updatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan review unit: %w", err)
@@ -177,6 +207,260 @@ func (s *Store) ListUnits(ctx context.Context, runID string) ([]domain.ReviewUni
 		return nil, fmt.Errorf("iterate review units: %w", err)
 	}
 	return units, nil
+}
+
+// StartReviewUnit 校验 Run lease 后，原子推进 Run 和 Unit 状态并增加 attempt。
+func (s *Store) StartReviewUnit(ctx context.Context, unitID, owner string, now time.Time) (domain.ReviewUnit, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("begin start review unit: %w", err)
+	}
+	defer tx.Rollback()
+	var currentOwner string
+	var leaseExpiresAt sql.NullString
+	err = tx.QueryRowContext(ctx, `
+		SELECT COALESCE(r.lease_owner, ''), r.lease_expires_at
+		FROM runs r JOIN review_units u ON u.run_id = r.id
+		WHERE u.id = ?`, unitID,
+	).Scan(&currentOwner, &leaseExpiresAt)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("read review unit lease: %w", err)
+	}
+	if currentOwner != owner || !leaseExpiresAt.Valid {
+		return domain.ReviewUnit{}, ErrLeaseHeld
+	}
+	expiresAt, err := parseTime(leaseExpiresAt.String)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("parse review unit lease expiry: %w", err)
+	}
+	if !expiresAt.After(now) {
+		return domain.ReviewUnit{}, ErrLeaseHeld
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE review_units SET status = ?, attempt = attempt + 1, updated_at = ?
+		WHERE id = ? AND status IN (?, ?, ?)`,
+		domain.UnitStatusRunning, timeText(now), unitID,
+		domain.UnitStatusPending, domain.UnitStatusRunning, domain.UnitStatusFailedRecoverable,
+	)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("start review unit: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("read start review unit result: %w", err)
+	}
+	if changed != 1 {
+		return domain.ReviewUnit{}, ErrUnitNotRunnable
+	}
+	result, err = tx.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = (SELECT run_id FROM review_units WHERE id = ?)
+		  AND status IN (?, ?)`,
+		domain.RunStatusReviewing, timeText(now), unitID,
+		domain.RunStatusPlanned, domain.RunStatusReviewing,
+	)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("start reviewing run: %w", err)
+	}
+	changed, err = result.RowsAffected()
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("read reviewing run result: %w", err)
+	}
+	if changed != 1 {
+		return domain.ReviewUnit{}, ErrUnitNotRunnable
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("commit start review unit: %w", err)
+	}
+	return s.getReviewUnit(ctx, unitID)
+}
+
+func (s *Store) getReviewUnit(ctx context.Context, unitID string) (domain.ReviewUnit, error) {
+	var unit domain.ReviewUnit
+	var createdAt, updatedAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, run_id, unit_key, file_path, start_line, end_line, diff_hunk,
+		       risk, status, attempt, created_at, updated_at
+		FROM review_units WHERE id = ?`, unitID,
+	).Scan(
+		&unit.ID, &unit.RunID, &unit.UnitKey, &unit.FilePath, &unit.StartLine, &unit.EndLine, &unit.DiffHunk,
+		&unit.Risk, &unit.Status, &unit.Attempt, &createdAt, &updatedAt,
+	)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("get review unit: %w", err)
+	}
+	unit.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("parse review unit created_at: %w", err)
+	}
+	unit.UpdatedAt, err = parseTime(updatedAt)
+	if err != nil {
+		return domain.ReviewUnit{}, fmt.Errorf("parse review unit updated_at: %w", err)
+	}
+	return unit, nil
+}
+
+// CompleteReviewUnit 在一个事务中保存 trace、候选问题和 completed checkpoint。
+func (s *Store) CompleteReviewUnit(ctx context.Context, trace domain.ReviewTrace, findings []domain.CandidateFindingRecord, owner string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin complete review unit: %w", err)
+	}
+	defer tx.Rollback()
+	if err := insertReviewTrace(ctx, tx, trace); err != nil {
+		return err
+	}
+	for _, finding := range findings {
+		evidenceJSON, err := json.Marshal(finding.Evidence)
+		if err != nil {
+			return fmt.Errorf("marshal finding evidence: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO candidate_findings (
+				id, run_id, unit_id, trace_id, detector, category, severity, file_path,
+				line, title, explanation, evidence_json, suggestion, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			finding.ID, finding.RunID, finding.UnitID, finding.TraceID, finding.Detector,
+			finding.Category, finding.Severity, finding.File, finding.Line, finding.Title,
+			finding.Explanation, string(evidenceJSON), finding.Suggestion, timeText(finding.CreatedAt),
+		); err != nil {
+			return fmt.Errorf("insert candidate finding: %w", err)
+		}
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE review_units SET status = ?, updated_at = ?
+		WHERE id = ? AND status = ?
+		  AND EXISTS (SELECT 1 FROM runs WHERE runs.id = review_units.run_id AND lease_owner = ?)`,
+		domain.UnitStatusCompleted, timeText(now), trace.UnitID, domain.UnitStatusRunning, owner,
+	)
+	if err != nil {
+		return fmt.Errorf("complete review unit: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read complete review unit result: %w", err)
+	}
+	if changed != 1 {
+		return ErrLeaseHeld
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit complete review unit: %w", err)
+	}
+	return nil
+}
+
+// FinishReviewUnit 保存无 finding 的失败或预算跳过 trace，并推进 Unit 状态。
+func (s *Store) FinishReviewUnit(ctx context.Context, trace domain.ReviewTrace, status domain.UnitStatus, owner string, now time.Time) error {
+	if status != domain.UnitStatusFailedRecoverable && status != domain.UnitStatusSkippedBudget {
+		return fmt.Errorf("unsupported review unit finish status %q", status)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin finish review unit: %w", err)
+	}
+	defer tx.Rollback()
+	if err := insertReviewTrace(ctx, tx, trace); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE review_units SET status = ?, updated_at = ?
+		WHERE id = ? AND status = ?
+		  AND EXISTS (SELECT 1 FROM runs WHERE runs.id = review_units.run_id AND lease_owner = ?)`,
+		status, timeText(now), trace.UnitID, domain.UnitStatusRunning, owner,
+	)
+	if err != nil {
+		return fmt.Errorf("finish review unit: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read finish review unit result: %w", err)
+	}
+	if changed != 1 {
+		return ErrLeaseHeld
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit finish review unit: %w", err)
+	}
+	return nil
+}
+
+func insertReviewTrace(ctx context.Context, tx *sql.Tx, trace domain.ReviewTrace) error {
+	rejectionsJSON, err := json.Marshal(trace.Rejections)
+	if err != nil {
+		return fmt.Errorf("marshal trace rejections: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO review_traces (
+			id, run_id, unit_id, call_id, detector, status, prompt, response,
+			rejections_json, error_message, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		trace.ID, trace.RunID, trace.UnitID, trace.CallID, trace.Detector, trace.Status,
+		trace.Prompt, trace.Response, string(rejectionsJSON), trace.ErrorMessage, timeText(trace.CreatedAt),
+	); err != nil {
+		return fmt.Errorf("insert review trace: %w", err)
+	}
+	return nil
+}
+
+// ListCandidateFindings 返回一个 Run 尚待 Verifier 处理的候选问题。
+func (s *Store) ListCandidateFindings(ctx context.Context, runID string) ([]domain.CandidateFindingRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, unit_id, trace_id, detector, category, severity, file_path,
+		       line, title, explanation, evidence_json, suggestion, created_at
+		FROM candidate_findings WHERE run_id = ? ORDER BY id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list candidate findings: %w", err)
+	}
+	defer rows.Close()
+	var findings []domain.CandidateFindingRecord
+	for rows.Next() {
+		var finding domain.CandidateFindingRecord
+		var evidenceJSON, createdAt string
+		if err := rows.Scan(
+			&finding.ID, &finding.RunID, &finding.UnitID, &finding.TraceID, &finding.Detector,
+			&finding.Category, &finding.Severity, &finding.File, &finding.Line, &finding.Title,
+			&finding.Explanation, &evidenceJSON, &finding.Suggestion, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan candidate finding: %w", err)
+		}
+		if err := json.Unmarshal([]byte(evidenceJSON), &finding.Evidence); err != nil {
+			return nil, fmt.Errorf("parse candidate evidence: %w", err)
+		}
+		finding.CreatedAt, err = parseTime(createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse candidate created_at: %w", err)
+		}
+		findings = append(findings, finding)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate candidate findings: %w", err)
+	}
+	return findings, nil
+}
+
+// GetReviewTrace 按 ID 返回一条已脱敏的模型审查证据链。
+func (s *Store) GetReviewTrace(ctx context.Context, traceID string) (domain.ReviewTrace, error) {
+	var trace domain.ReviewTrace
+	var rejectionsJSON, createdAt string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, run_id, unit_id, call_id, detector, status, prompt, response,
+		       rejections_json, error_message, created_at
+		FROM review_traces WHERE id = ?`, traceID,
+	).Scan(
+		&trace.ID, &trace.RunID, &trace.UnitID, &trace.CallID, &trace.Detector, &trace.Status,
+		&trace.Prompt, &trace.Response, &rejectionsJSON, &trace.ErrorMessage, &createdAt,
+	)
+	if err != nil {
+		return domain.ReviewTrace{}, fmt.Errorf("get review trace: %w", err)
+	}
+	if err := json.Unmarshal([]byte(rejectionsJSON), &trace.Rejections); err != nil {
+		return domain.ReviewTrace{}, fmt.Errorf("parse trace rejections: %w", err)
+	}
+	trace.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return domain.ReviewTrace{}, fmt.Errorf("parse trace created_at: %w", err)
+	}
+	return trace, nil
 }
 
 // SaveSnapshot 为 Run 保存一次不可变的变更快照。
@@ -238,9 +522,10 @@ func (s *Store) SavePlan(ctx context.Context, runID string, units []domain.Revie
 	for _, unit := range units {
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO review_units (
-				id, run_id, unit_key, file_path, risk, status, attempt, created_at, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			unit.ID, unit.RunID, unit.UnitKey, unit.FilePath, unit.Risk, unit.Status,
+				id, run_id, unit_key, file_path, start_line, end_line, diff_hunk,
+				risk, status, attempt, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			unit.ID, unit.RunID, unit.UnitKey, unit.FilePath, unit.StartLine, unit.EndLine, unit.DiffHunk, unit.Risk, unit.Status,
 			unit.Attempt, timeText(unit.CreatedAt), timeText(unit.UpdatedAt),
 		); err != nil {
 			return fmt.Errorf("insert planned unit: %w", err)

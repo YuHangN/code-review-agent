@@ -50,6 +50,10 @@ type ReviewUnit struct {
 	RunID     string
 	UnitKey   string
 	FilePath  string
+	StartLine int
+	EndLine   int
+	// DiffHunk 是 Planner 从脱敏 Snapshot 中切出的不可变审查输入。
+	DiffHunk  string
 	Risk      string
 	Status    UnitStatus
 	Attempt   int

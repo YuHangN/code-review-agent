@@ -2,7 +2,24 @@ package migrations
 
 import _ "embed"
 
-// SQL 包含初始数据库 schema。
-//
+// Migration 是按版本顺序执行的一次数据库结构升级。
+type Migration struct {
+	Version int
+	SQL     string
+}
+
 //go:embed 001_init.sql
-var SQL string
+var initialSQL string
+
+//go:embed 002_review_unit_input.sql
+var reviewUnitInputSQL string
+
+//go:embed 003_review_results.sql
+var reviewResultsSQL string
+
+// All 按版本号升序返回全部 migration。
+var All = []Migration{
+	{Version: 1, SQL: initialSQL},
+	{Version: 2, SQL: reviewUnitInputSQL},
+	{Version: 3, SQL: reviewResultsSQL},
+}

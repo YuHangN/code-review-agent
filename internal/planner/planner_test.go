@@ -20,6 +20,12 @@ func TestPlanCreatesDeterministicUnitsAndSkipsLowValueFiles(t *testing.T) {
 	if first[0].UnitKey != second[0].UnitKey || first[0].Status != domain.UnitStatusPending {
 		t.Fatalf("units are not deterministic: %#v %#v", first[0], second[0])
 	}
+	if first[0].StartLine != 1 || first[0].EndLine != 4 {
+		t.Fatalf("unit lines = %d-%d, want 1-4", first[0].StartLine, first[0].EndLine)
+	}
+	if first[0].DiffHunk != "@@ -1,2 +1,4 @@\n+token := input\n" {
+		t.Fatalf("diff hunk = %q", first[0].DiffHunk)
+	}
 }
 
 func TestPlanSkipsSecurityExcludedFileBlocks(t *testing.T) {

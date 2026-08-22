@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sort"
@@ -11,6 +12,61 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 )
+
+func TestOpenMigratesExistingReviewUnitsWithPersistedInputColumns(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "review.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.ExecContext(ctx, `CREATE TABLE review_units (
+id TEXT PRIMARY KEY, run_id TEXT NOT NULL, unit_key TEXT NOT NULL, file_path TEXT NOT NULL,
+risk TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL, created_at TEXT NOT NULL,
+updated_at TEXT NOT NULL, UNIQUE(run_id, unit_key))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := sqlite.Open(ctx, path, sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err = sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	rows, err := raw.QueryContext(ctx, `PRAGMA table_info(review_units)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	want := map[string]bool{"start_line": false, "end_line": false, "diff_hunk": false}
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := want[name]; ok {
+			want[name] = true
+		}
+	}
+	for column, found := range want {
+		if !found {
+			t.Fatalf("migration did not add review_units.%s", column)
+		}
+	}
+}
 
 func TestStoreCreateRunPersistsUnitsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
@@ -212,7 +268,11 @@ func TestStoreSavePlanPersistsUnitsAndPlannedStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := run.CreatedAt.Add(time.Minute)
-	units := []domain.ReviewUnit{{ID: "unit-1", RunID: run.ID, UnitKey: "key-1", FilePath: "main.go", Risk: "medium", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}}
+	units := []domain.ReviewUnit{{
+		ID: "unit-1", RunID: run.ID, UnitKey: "key-1", FilePath: "main.go",
+		StartLine: 12, EndLine: 14, DiffHunk: "@@ -12 +12,3 @@\n+changed\n",
+		Risk: "medium", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now,
+	}}
 
 	if err := store.SavePlan(ctx, run.ID, units, now); err != nil {
 		t.Fatal(err)
@@ -227,6 +287,9 @@ func TestStoreSavePlanPersistsUnitsAndPlannedStatus(t *testing.T) {
 	}
 	if gotRun.Status != domain.RunStatusPlanned || len(gotUnits) != 1 || gotUnits[0].ID != "unit-1" {
 		t.Fatalf("run status = %q, units = %#v", gotRun.Status, gotUnits)
+	}
+	if gotUnits[0].StartLine != 12 || gotUnits[0].EndLine != 14 || gotUnits[0].DiffHunk != units[0].DiffHunk {
+		t.Fatalf("persisted unit input = %#v, want %#v", gotUnits[0], units[0])
 	}
 }
 
