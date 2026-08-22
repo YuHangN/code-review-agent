@@ -13,6 +13,7 @@ import (
 
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
+	"github.com/YuHangN/code-review-agent/internal/planner"
 	"github.com/YuHangN/code-review-agent/internal/scm"
 	"github.com/YuHangN/code-review-agent/internal/security"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
@@ -50,7 +51,7 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// executeRun 拉取 GitHub PR 的固定 Snapshot，并原子创建一个 fetched Run。
+// executeRun 拉取并脱敏固定 Snapshot，再生成 Unit 并推进到 planned checkpoint。
 func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -116,11 +117,22 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
-	if err := workflow.NewService(store).StartFetched(ctx, workflow.FetchedRunRequest{Run: run, Snapshot: snapshot}); err != nil {
+	service := workflow.NewService(store)
+	if err := service.StartFetched(ctx, workflow.FetchedRunRequest{Run: run, Snapshot: snapshot}); err != nil {
 		fmt.Fprintf(stderr, "create fetched run: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\nredactions=%d\nexcluded_files=%d\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA, len(sanitized.Redactions), len(sanitized.ExcludedFiles))
+	units := planner.New().Plan(planner.Request{
+		RunID:   run.ID,
+		HeadSHA: snapshot.HeadSHA,
+		Diff:    snapshot.Diff,
+		Now:     now,
+	})
+	if err := service.SavePlan(ctx, run.ID, units, now); err != nil {
+		fmt.Fprintf(stderr, "save review plan: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\nunits=%d\nredactions=%d\nexcluded_files=%d\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA, len(units), len(sanitized.Redactions), len(sanitized.ExcludedFiles))
 	return 0
 }
 

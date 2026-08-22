@@ -18,6 +18,7 @@ var (
 type Store interface {
 	CreateRun(ctx context.Context, run domain.Run, units []domain.ReviewUnit) error
 	CreateRunWithSnapshot(ctx context.Context, run domain.Run, units []domain.ReviewUnit, snapshot domain.ChangeSnapshot) error
+	SavePlan(ctx context.Context, runID string, units []domain.ReviewUnit, now time.Time) error
 	ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error)
 	ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error)
 }
@@ -79,6 +80,22 @@ func (s Service) StartFetched(ctx context.Context, request FetchedRunRequest) er
 	}
 	if err := s.store.CreateRunWithSnapshot(ctx, request.Run, request.Units, request.Snapshot); err != nil {
 		return fmt.Errorf("create fetched run: %w", err)
+	}
+	return nil
+}
+
+// SavePlan 校验 Unit 归属后，原子保存规划结果和 planned checkpoint。
+func (s Service) SavePlan(ctx context.Context, runID string, units []domain.ReviewUnit, now time.Time) error {
+	if runID == "" {
+		return ErrRunIDRequired
+	}
+	for _, unit := range units {
+		if unit.RunID != runID {
+			return ErrUnitRunMismatch
+		}
+	}
+	if err := s.store.SavePlan(ctx, runID, units, now); err != nil {
+		return fmt.Errorf("save plan: %w", err)
 	}
 	return nil
 }

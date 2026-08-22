@@ -9,7 +9,7 @@ const (
 	RunStatusCreated     RunStatus = "created"
 	RunStatusFetching    RunStatus = "fetching"
 	RunStatusFetched     RunStatus = "fetched"
-	RunStatusPlanning    RunStatus = "planning"
+	RunStatusPlanned     RunStatus = "planned"
 	RunStatusReviewing   RunStatus = "reviewing"
 	RunStatusAggregating RunStatus = "aggregating"
 	RunStatusReported    RunStatus = "reported"

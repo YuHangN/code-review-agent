@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/cli"
+	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 )
 
@@ -167,6 +168,17 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(snapshot.Diff, "<REDACTED:API_KEY:1>") {
 		t.Fatalf("persisted snapshot = %q, want redaction placeholder", snapshot.Diff)
+	}
+	storedRun, err := store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	units, err := store.ListUnits(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedRun.Status != domain.RunStatusPlanned || len(units) != 1 || units[0].Status != domain.UnitStatusPending {
+		t.Fatalf("run status = %q, units = %#v", storedRun.Status, units)
 	}
 }
 

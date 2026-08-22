@@ -203,3 +203,73 @@ func TestStorePersistsImmutableSnapshot(t *testing.T) {
 		t.Fatal("saving a second snapshot succeeded, want immutable conflict")
 	}
 }
+
+func TestStoreSavePlanPersistsUnitsAndPlannedStatus(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	run := fetchedRun("run-plan")
+	if err := store.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	now := run.CreatedAt.Add(time.Minute)
+	units := []domain.ReviewUnit{{ID: "unit-1", RunID: run.ID, UnitKey: "key-1", FilePath: "main.go", Risk: "medium", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}}
+
+	if err := store.SavePlan(ctx, run.ID, units, now); err != nil {
+		t.Fatal(err)
+	}
+	gotRun, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotUnits, err := store.ListUnits(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRun.Status != domain.RunStatusPlanned || len(gotUnits) != 1 || gotUnits[0].ID != "unit-1" {
+		t.Fatalf("run status = %q, units = %#v", gotRun.Status, gotUnits)
+	}
+}
+
+func TestStoreSavePlanRollsBackStatusWhenUnitInsertFails(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	run := fetchedRun("run-rollback")
+	if err := store.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	now := run.CreatedAt.Add(time.Minute)
+	units := []domain.ReviewUnit{
+		{ID: "same-id", RunID: run.ID, UnitKey: "key-1", FilePath: "a.go", Risk: "medium", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now},
+		{ID: "same-id", RunID: run.ID, UnitKey: "key-2", FilePath: "b.go", Risk: "medium", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now},
+	}
+
+	if err := store.SavePlan(ctx, run.ID, units, now); err == nil {
+		t.Fatal("SavePlan succeeded, want duplicate unit failure")
+	}
+	gotRun, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotUnits, err := store.ListUnits(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRun.Status != domain.RunStatusFetched || len(gotUnits) != 0 {
+		t.Fatalf("rollback left status = %q, units = %#v", gotRun.Status, gotUnits)
+	}
+}
+
+func openTestStore(t *testing.T) *sqlite.Store {
+	t.Helper()
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
+}
+
+func fetchedRun(id string) domain.Run {
+	now := time.Date(2026, 8, 22, 0, 0, 0, 0, time.UTC)
+	return domain.Run{ID: id, SourceURL: "https://github.com/acme/repo/pull/1", Provider: "github", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusFetched, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+}

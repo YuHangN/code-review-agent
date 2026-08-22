@@ -79,6 +79,17 @@ func TestStartFetchedPersistsRunAndSnapshotTogether(t *testing.T) {
 	}
 }
 
+func TestSavePlanRejectsUnitForDifferentRun(t *testing.T) {
+	service := workflow.NewService(openStore(t))
+	now := time.Date(2026, 8, 22, 0, 1, 0, 0, time.UTC)
+	err := service.SavePlan(context.Background(), "run-001", []domain.ReviewUnit{
+		testUnit("run-002", "unit-001", domain.UnitStatusPending),
+	}, now)
+	if !errors.Is(err, workflow.ErrUnitRunMismatch) {
+		t.Fatalf("SavePlan error = %v, want ErrUnitRunMismatch", err)
+	}
+}
+
 func TestResumeReturnsOnlyResumableUnits(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t)
@@ -237,6 +248,10 @@ func (s *heartbeatStore) CreateRun(context.Context, domain.Run, []domain.ReviewU
 }
 
 func (s *heartbeatStore) CreateRunWithSnapshot(context.Context, domain.Run, []domain.ReviewUnit, domain.ChangeSnapshot) error {
+	return nil
+}
+
+func (s *heartbeatStore) SavePlan(context.Context, string, []domain.ReviewUnit, time.Time) error {
 	return nil
 }
 

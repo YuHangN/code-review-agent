@@ -210,6 +210,47 @@ func (s *Store) GetSnapshot(ctx context.Context, runID string) (domain.ChangeSna
 	return snapshot, nil
 }
 
+// SavePlan 原子保存 Planner 产出的 Unit，并将 Run 推进到 planned。
+func (s *Store) SavePlan(ctx context.Context, runID string, units []domain.ReviewUnit, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save plan: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = ? AND status = ?`,
+		domain.RunStatusPlanned, timeText(now), runID, domain.RunStatusFetched,
+	)
+	if err != nil {
+		return fmt.Errorf("update run plan status: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read plan status update: %w", err)
+	}
+	if changed != 1 {
+		return fmt.Errorf("run %q is not in fetched status", runID)
+	}
+
+	for _, unit := range units {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO review_units (
+				id, run_id, unit_key, file_path, risk, status, attempt, created_at, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			unit.ID, unit.RunID, unit.UnitKey, unit.FilePath, unit.Risk, unit.Status,
+			unit.Attempt, timeText(unit.CreatedAt), timeText(unit.UpdatedAt),
+		); err != nil {
+			return fmt.Errorf("insert planned unit: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit save plan: %w", err)
+	}
+	return nil
+}
+
 // ClaimRun 获取或续期 Run 的 lease；其他 owner 只能在 lease 过期后接管。
 func (s *Store) ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error) {
 	if strings.TrimSpace(owner) == "" {
