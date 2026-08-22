@@ -19,23 +19,12 @@ type Store struct {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
 	store := &Store{db: db}
-	for _, pragma := range []string{
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA busy_timeout = 5000",
-	} {
-		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("configure database: %w", err)
-		}
-	}
-
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		_ = db.Close()
