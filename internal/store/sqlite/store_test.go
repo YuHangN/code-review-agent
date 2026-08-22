@@ -52,7 +52,7 @@ func TestStoreCreateRunPersistsUnitsAcrossReopen(t *testing.T) {
 		},
 	}
 
-	store, err := sqlite.Open(ctx, path)
+	store, err := sqlite.Open(ctx, path, sqlite.Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestStoreCreateRunPersistsUnitsAcrossReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err = sqlite.Open(ctx, path)
+	store, err = sqlite.Open(ctx, path, sqlite.Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestStoreCreateRunPersistsUnitsAcrossReopen(t *testing.T) {
 
 func TestStoreClaimRunRejectsOtherOwnerUntilLeaseExpires(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"))
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestStoreClaimRunRejectsOtherOwnerUntilLeaseExpires(t *testing.T) {
 
 func TestStoreClaimRunRejectsEmptyOwner(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"))
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

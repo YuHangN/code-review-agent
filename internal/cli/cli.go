@@ -10,12 +10,16 @@ import (
 	"os"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
 
-const defaultDBPath = "review-agent.db"
+const (
+	defaultDBPath     = "review-agent.db"
+	defaultConfigPath = "config/runtime.yaml"
+)
 
 // Execute 解析一个 CLI 子命令，并返回进程退出码。
 // 输出 writer 由调用方传入，方便测试命令行为而无需真实终端。
@@ -41,7 +45,7 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 // executeDemo 写入一个固定的离线 Run，包含不同 checkpoint 状态的 Unit。
 func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	dbPath, rest, ok := parseDB("demo", args, stderr)
+	dbPath, configPath, rest, ok := parseOptions("demo", args, stderr)
 	if !ok {
 		return 2
 	}
@@ -50,7 +54,7 @@ func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		return 2
 	}
 
-	store, err := sqlite.Open(ctx, dbPath)
+	store, _, err := openStore(ctx, dbPath, configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
 		return 1
@@ -79,7 +83,7 @@ func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) i
 
 // executeStatus 输出已持久化 Run 及其 Unit 状态汇总。
 func executeStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	dbPath, rest, ok := parseDB("status", args, stderr)
+	dbPath, configPath, rest, ok := parseOptions("status", args, stderr)
 	if !ok {
 		return 2
 	}
@@ -88,7 +92,7 @@ func executeStatus(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return 2
 	}
 
-	store, err := sqlite.Open(ctx, dbPath)
+	store, _, err := openStore(ctx, dbPath, configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
 		return 1
@@ -124,7 +128,7 @@ func executeStatus(ctx context.Context, args []string, stdout, stderr io.Writer)
 
 // executeResume 为当前 CLI 领取 Run，并输出仍需处理的 Unit。
 func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	dbPath, rest, ok := parseDB("resume", args, stderr)
+	dbPath, configPath, rest, ok := parseOptions("resume", args, stderr)
 	if !ok {
 		return 2
 	}
@@ -133,7 +137,7 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return 2
 	}
 
-	store, err := sqlite.Open(ctx, dbPath)
+	store, runtime, err := openStore(ctx, dbPath, configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
 		return 1
@@ -145,7 +149,7 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
 		return 1
 	}
-	result, err := workflow.NewService(store).Resume(ctx, rest[0], owner, time.Now().UTC(), time.Minute)
+	result, err := workflow.NewService(store).Resume(ctx, rest[0], owner, time.Now().UTC(), runtime.LeaseTTL)
 	if err != nil {
 		fmt.Fprintf(stderr, "resume run: %v\n", err)
 		return 1
@@ -172,15 +176,29 @@ func newExecutorID() (string, error) {
 	return fmt.Sprintf("cli-%s-%d-%s", hostname, os.Getpid(), hex.EncodeToString(randomBytes[:])), nil
 }
 
-// parseDB 解析所有子命令共用的 --db 参数，并保留位置参数给各命令处理。
-func parseDB(name string, args []string, stderr io.Writer) (string, []string, bool) {
+// parseOptions 解析所有子命令共用的数据库与运行时配置参数。
+func parseOptions(name string, args []string, stderr io.Writer) (string, string, []string, bool) {
 	flags := flag.NewFlagSet(name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
+	configPath := flags.String("config", defaultConfigPath, "runtime config path")
 	if err := flags.Parse(args); err != nil {
-		return "", nil, false
+		return "", "", nil, false
 	}
-	return *dbPath, flags.Args(), true
+	return *dbPath, *configPath, flags.Args(), true
+}
+
+// openStore 读取运行时配置，并以其中的 SQLite 参数打开数据库。
+func openStore(ctx context.Context, dbPath, configPath string) (*sqlite.Store, config.Runtime, error) {
+	runtime, err := config.LoadRuntime(configPath)
+	if err != nil {
+		return nil, config.Runtime{}, fmt.Errorf("load runtime config: %w", err)
+	}
+	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: runtime.SQLiteBusyTimeout})
+	if err != nil {
+		return nil, config.Runtime{}, err
+	}
+	return store, runtime, nil
 }
 
 // demoUnits 为离线 Demo 创建各种与恢复相关状态的 Unit。
@@ -208,5 +226,5 @@ func newDemoUnit(runID, id string, status domain.UnitStatus, now time.Time) doma
 }
 
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: review-agent <demo|status|resume> [--db path] [run-id]")
+	fmt.Fprintln(writer, "usage: review-agent <demo|status|resume> [--db path] [--config path] [run-id]")
 }

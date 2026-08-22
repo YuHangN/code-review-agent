@@ -25,10 +25,18 @@ type Store struct {
 	db *sql.DB
 }
 
+// Options 控制 SQLite 连接的运行时参数。
+type Options struct {
+	BusyTimeout time.Duration
+}
+
 // Open 配置 SQLite 的并发与持久化选项，并执行初始 schema migration。
 // DSN 中的 pragma 会应用到 database/sql 新建的每条物理连接。
-func Open(ctx context.Context, path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path+"?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+func Open(ctx context.Context, path string, options Options) (*Store, error) {
+	if options.BusyTimeout < time.Millisecond {
+		return nil, fmt.Errorf("SQLite busy timeout must be at least 1ms")
+	}
+	db, err := sql.Open("sqlite", fmt.Sprintf("%s?_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)", path, options.BusyTimeout.Milliseconds()))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}

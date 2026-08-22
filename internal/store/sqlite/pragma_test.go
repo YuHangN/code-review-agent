@@ -4,11 +4,12 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestOpenEnforcesForeignKeysOnEachConnection(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(ctx, filepath.Join(t.TempDir(), "review.db"))
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "review.db"), Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +33,7 @@ func TestOpenEnforcesForeignKeysOnEachConnection(t *testing.T) {
 
 func TestOpenSetsBusyTimeoutOnEachConnection(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(ctx, filepath.Join(t.TempDir(), "review.db"))
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "review.db"), Options{BusyTimeout: 75 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,14 +50,14 @@ func TestOpenSetsBusyTimeoutOnEachConnection(t *testing.T) {
 	if err := store.db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); err != nil {
 		t.Fatal(err)
 	}
-	if timeout != 5000 {
-		t.Fatalf("busy_timeout = %d, want 5000", timeout)
+	if timeout != 75 {
+		t.Fatalf("busy_timeout = %d, want 75", timeout)
 	}
 }
 
 func TestOpenEnablesWALJournalMode(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(ctx, filepath.Join(t.TempDir(), "review.db"))
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "review.db"), Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}

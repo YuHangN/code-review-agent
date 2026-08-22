@@ -107,9 +107,64 @@ func TestResumeReturnsLeaseConflict(t *testing.T) {
 	}
 }
 
+func TestMaintainLeaseRenewsUntilContextIsCancelled(t *testing.T) {
+	store := &heartbeatStore{claimed: make(chan string, 1)}
+	service := workflow.NewService(store)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	leaseErrors, err := service.MaintainLease(ctx, "run-001", "worker-a", workflow.LeaseSettings{
+		TTL:           time.Minute,
+		RenewInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case owner := <-store.claimed:
+		if owner != "worker-a" {
+			t.Fatalf("lease owner = %q, want worker-a", owner)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease was not renewed")
+	}
+
+	cancel()
+	select {
+	case _, ok := <-leaseErrors:
+		if ok {
+			t.Fatal("lease maintenance reported an unexpected error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease maintenance did not stop after context cancellation")
+	}
+}
+
+func TestMaintainLeaseReportsRenewalFailure(t *testing.T) {
+	store := &heartbeatStore{err: errors.New("database unavailable")}
+	service := workflow.NewService(store)
+
+	leaseErrors, err := service.MaintainLease(context.Background(), "run-001", "worker-a", workflow.LeaseSettings{
+		TTL:           time.Minute,
+		RenewInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case err := <-leaseErrors:
+		if !errors.Is(err, store.err) {
+			t.Fatalf("renewal error = %v, want %v", err, store.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lease renewal failure was not reported")
+	}
+}
+
 func openStore(t *testing.T) *sqlite.Store {
 	t.Helper()
-	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "review.db"))
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,4 +199,24 @@ func testUnit(runID, id string, status domain.UnitStatus) domain.ReviewUnit {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
+}
+
+type heartbeatStore struct {
+	claimed chan string
+	err     error
+}
+
+func (s *heartbeatStore) CreateRun(context.Context, domain.Run, []domain.ReviewUnit) error {
+	return nil
+}
+
+func (s *heartbeatStore) ClaimRun(_ context.Context, _ string, owner string, _ time.Time, _ time.Duration) (domain.Run, error) {
+	if s.claimed != nil {
+		s.claimed <- owner
+	}
+	return domain.Run{}, s.err
+}
+
+func (s *heartbeatStore) ListUnits(context.Context, string) ([]domain.ReviewUnit, error) {
+	return nil, nil
 }
