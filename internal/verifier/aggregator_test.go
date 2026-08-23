@@ -41,10 +41,48 @@ func TestAggregatorVerifiesDeduplicatesAndCheckpointsFindings(t *testing.T) {
 	}
 }
 
+func TestAggregatorUsesAgentToolEvidenceWhenVerifyingFinding(t *testing.T) {
+	now := time.Date(2026, 8, 23, 2, 0, 0, 0, time.UTC)
+	candidate := testCandidate("candidate-secret", "security", 2, "配置中包含硬编码 API Key")
+	store := &aggregatorStore{
+		candidates: []domain.CandidateFindingRecord{candidate},
+		unit: domain.ReviewUnit{
+			ID: "unit-001", RunID: "run-001", FilePath: "config.yaml",
+			DiffHunk: "@@ -0,0 +1,2 @@\n+package config\n+api_key: \"<REDACTED:API_KEY:1>\"\n",
+		},
+		steps: []domain.AgentStep{{
+			RunID: "run-001", UnitID: "unit-001", Round: 1,
+			ToolCalls: []domain.AgentToolCall{{
+				ID: "tool-1", Name: "read_file", Arguments: `{"path":"config.yaml"}`,
+			}},
+			ToolResults: []domain.AgentToolResult{{
+				CallID: "tool-1", Name: "read_file",
+				Content: `{"path":"config.yaml","sha":"head-sha","content":"package config\napi_key: \"<REDACTED:API_KEY:1>\"\n","redactions":1}`,
+			}},
+		}},
+	}
+
+	result, err := verifier.NewAggregator(store, verifier.NewDefault()).Aggregate(context.Background(), "run-001", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Confirmed != 1 || len(store.saved) != 1 {
+		t.Fatalf("aggregate result = %#v, findings = %#v", result, store.saved)
+	}
+	if store.saved[0].VerificationSource != "tool:read_file+rule:redacted_secret_assignment" {
+		t.Fatalf("verification source = %q", store.saved[0].VerificationSource)
+	}
+	if store.stepReads != 1 {
+		t.Fatalf("agent step reads = %d, want 1", store.stepReads)
+	}
+}
+
 type aggregatorStore struct {
 	candidates []domain.CandidateFindingRecord
 	unit       domain.ReviewUnit
+	steps      []domain.AgentStep
 	unitReads  int
+	stepReads  int
 	saved      []domain.VerifiedFinding
 }
 
@@ -55,6 +93,11 @@ func (store *aggregatorStore) ListCandidateFindings(context.Context, string) ([]
 func (store *aggregatorStore) GetReviewUnit(context.Context, string) (domain.ReviewUnit, error) {
 	store.unitReads++
 	return store.unit, nil
+}
+
+func (store *aggregatorStore) ListAgentSteps(context.Context, string) ([]domain.AgentStep, error) {
+	store.stepReads++
+	return append([]domain.AgentStep(nil), store.steps...), nil
 }
 
 func (store *aggregatorStore) ReplaceVerifiedFindings(_ context.Context, _ string, findings []domain.VerifiedFinding) error {

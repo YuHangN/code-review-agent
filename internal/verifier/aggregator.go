@@ -16,12 +16,13 @@ var ErrInvalidAggregation = errors.New("invalid finding aggregation")
 type AggregatorStore interface {
 	ListCandidateFindings(ctx context.Context, runID string) ([]domain.CandidateFindingRecord, error)
 	GetReviewUnit(ctx context.Context, unitID string) (domain.ReviewUnit, error)
+	ListAgentSteps(ctx context.Context, unitID string) ([]domain.AgentStep, error)
 	ReplaceVerifiedFindings(ctx context.Context, runID string, findings []domain.VerifiedFinding) error
 }
 
 // CandidateVerifier 允许 Aggregator 使用默认规则集或测试实现。
 type CandidateVerifier interface {
-	Verify(candidate domain.CandidateFindingRecord, unit domain.ReviewUnit, now time.Time) domain.VerifiedFinding
+	VerifyWithEvidence(candidate domain.CandidateFindingRecord, unit domain.ReviewUnit, steps []domain.AgentStep, now time.Time) domain.VerifiedFinding
 }
 
 // AggregatorResult 汇总候选数量、最终数量及证据等级覆盖情况。
@@ -55,6 +56,7 @@ func (aggregator Aggregator) Aggregate(ctx context.Context, runID string, now ti
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
 	result := AggregatorResult{Candidates: len(candidates)}
 	units := make(map[string]domain.ReviewUnit)
+	stepsByUnit := make(map[string][]domain.AgentStep)
 	byFingerprint := make(map[string]domain.VerifiedFinding)
 	for _, candidate := range candidates {
 		if candidate.RunID != runID {
@@ -71,7 +73,20 @@ func (aggregator Aggregator) Aggregate(ctx context.Context, runID string, now ti
 			}
 			units[candidate.UnitID] = unit
 		}
-		finding := aggregator.verifier.Verify(candidate, unit, now)
+		steps, ok := stepsByUnit[candidate.UnitID]
+		if !ok {
+			steps, err = aggregator.store.ListAgentSteps(ctx, candidate.UnitID)
+			if err != nil {
+				return AggregatorResult{}, fmt.Errorf("list candidate agent steps %s: %w", candidate.UnitID, err)
+			}
+			for _, step := range steps {
+				if step.RunID != runID || step.UnitID != candidate.UnitID {
+					return AggregatorResult{}, fmt.Errorf("agent step for unit %q belongs to another run or unit", candidate.UnitID)
+				}
+			}
+			stepsByUnit[candidate.UnitID] = steps
+		}
+		finding := aggregator.verifier.VerifyWithEvidence(candidate, unit, steps, now)
 		if current, exists := byFingerprint[finding.Fingerprint]; exists {
 			result.Duplicates++
 			if preferFinding(finding, current) {

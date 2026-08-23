@@ -50,7 +50,7 @@ Reviewer 使用有边界的结构化 Tool-Calling Loop，不解析自由文本 R
 - `read_file` 只读取首次固定的 `head_sha`，拒绝路径穿越和敏感文件。
 - `search_symbol` 首版只搜索固定且已脱敏的 PR diff。
 - 每轮模型调用独立记账；恢复时复用已经完成的 Agent Step。
-- Verifier 不主动调用模型或工具，只对最终 Candidate Finding 做确定性分类。
+- Verifier 不主动调用模型或工具，只读取已落盘的 diff 与工具证据做确定性分类。
 
 ## Review 工作流
 
@@ -60,7 +60,7 @@ PR URL
   → 获取并固定 base/head SHA Snapshot
   → 脱敏、切分并按风险排序 Review Unit
   → Reviewer 按需调用受限工具并提出候选问题
-  → Verifier 使用确定性规则分类为 confirmed / advisory
+  → Verifier 关联 diff 与工具证据，分类为 confirmed / advisory
   → 保存 checkpoint 和预算账本
   → 生成 Markdown 报告
 ```

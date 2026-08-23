@@ -50,6 +50,29 @@ func TestVerifierKeepsLLMOnlyFindingAdvisory(t *testing.T) {
 	}
 }
 
+func TestVerifierRejectsToolEvidenceThatDoesNotMatchAddedLine(t *testing.T) {
+	now := time.Date(2026, 8, 23, 0, 30, 0, 0, time.UTC)
+	candidate := testCandidate("candidate-secret", "security", 2, "配置中包含硬编码 API Key")
+	unit := domain.ReviewUnit{
+		ID: "unit-secret", RunID: candidate.RunID, FilePath: candidate.File,
+		DiffHunk: "@@ -0,0 +1,2 @@\n+package config\n+api_key: os.Getenv(\"API_KEY\")\n",
+	}
+	steps := []domain.AgentStep{{
+		RunID: candidate.RunID, UnitID: candidate.UnitID, Round: 1,
+		ToolCalls: []domain.AgentToolCall{{ID: "tool-1", Name: "read_file", Arguments: `{"path":"config.yaml"}`}},
+		ToolResults: []domain.AgentToolResult{{
+			CallID: "tool-1", Name: "read_file",
+			Content: `{"path":"config.yaml","sha":"head-sha","content":"package config\napi_key: \"<REDACTED:API_KEY:1>\"\n","redactions":1}`,
+		}},
+	}}
+
+	finding := verifier.NewDefault().VerifyWithEvidence(candidate, unit, steps, now)
+
+	if finding.Confidence != domain.ConfidenceAdvisory {
+		t.Fatalf("confidence = %q, want %q", finding.Confidence, domain.ConfidenceAdvisory)
+	}
+}
+
 func TestVerifierGeneratesSameFingerprintForDuplicateCandidates(t *testing.T) {
 	now := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
 	first := testCandidate("candidate-a", "security", 2, "配置中包含硬编码 API Key")
