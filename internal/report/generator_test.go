@@ -20,7 +20,7 @@ func TestGeneratorWritesFileAndCheckpointsReport(t *testing.T) {
 		run:      domain.Run{ID: "run-001", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusAggregating, BudgetLimitMicros: 1_000_000},
 		snapshot: domain.ChangeSnapshot{BaseSHA: "base", HeadSHA: "head"},
 		units:    []domain.ReviewUnit{{ID: "unit-1", Status: domain.UnitStatusCompleted}},
-		findings: []domain.VerifiedFinding{{ID: "finding-1", TraceID: "trace-1", Confidence: domain.ConfidenceAdvisory, VerificationSource: "llm_reasoning_only", VerificationReason: "仅模型推理", Severity: "medium", File: "main.go", Line: 3, Title: "候选问题", Explanation: "问题说明", Evidence: []string{"候选证据"}, Suggestion: "检查实现"}},
+		findings: []domain.Finding{{ID: "finding-1", TraceID: "trace-1", Confidence: domain.ConfidenceAdvisory, VerificationSource: "llm_reasoning_only", VerificationReason: "仅模型推理", Severity: "medium", File: "main.go", Line: 3, Title: "候选问题", Explanation: "问题说明", Evidence: []string{"候选证据"}, Suggestion: "检查实现"}},
 		budget:   budget.Summary{ActualMicros: 100, CommittedMicros: 100},
 	}
 	outputPath := filepath.Join(t.TempDir(), "nested", "report.md")
@@ -69,7 +69,7 @@ type reportStore struct {
 	run         domain.Run
 	snapshot    domain.ChangeSnapshot
 	units       []domain.ReviewUnit
-	findings    []domain.VerifiedFinding
+	findings    []domain.Finding
 	budget      budget.Summary
 	report      domain.Report
 	saved       domain.Report
@@ -90,7 +90,7 @@ func (store *reportStore) ListUnits(context.Context, string) ([]domain.ReviewUni
 	return store.units, nil
 }
 
-func (store *reportStore) ListVerifiedFindings(context.Context, string) ([]domain.VerifiedFinding, error) {
+func (store *reportStore) ListFindings(context.Context, string) ([]domain.Finding, error) {
 	store.sourceReads++
 	return store.findings, nil
 }

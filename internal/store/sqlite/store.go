@@ -874,7 +874,7 @@ func (s *Store) ListAgentSteps(ctx context.Context, unitID string) ([]domain.Age
 	return steps, nil
 }
 
-// ListCandidateFindings 返回一个 Run 尚待 Verifier 处理的候选问题。
+// ListCandidateFindings 返回一个 Run 尚待聚合的 LLM 候选问题。
 func (s *Store) ListCandidateFindings(ctx context.Context, runID string) ([]domain.CandidateFindingRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, run_id, unit_id, trace_id, detector, category, severity, file_path,
@@ -935,37 +935,37 @@ func (s *Store) GetReviewTrace(ctx context.Context, traceID string) (domain.Revi
 	return trace, nil
 }
 
-// ReplaceVerifiedFindings 原子替换一次 Run 的全部验证结果。
-// Verifier 是确定性的，因此恢复时可以安全重算；事务保证不会留下半批结果。
-func (s *Store) ReplaceVerifiedFindings(ctx context.Context, runID string, findings []domain.VerifiedFinding) error {
+// ReplaceFindings 原子替换一次 Run 的全部聚合结果。
+// Aggregator 是确定性的，因此恢复时可以安全重算；事务保证不会留下半批结果。
+func (s *Store) ReplaceFindings(ctx context.Context, runID string, findings []domain.Finding) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin replace verified findings: %w", err)
+		return fmt.Errorf("begin replace findings: %w", err)
 	}
 	defer tx.Rollback()
 	var status domain.RunStatus
 	if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&status); err != nil {
-		return fmt.Errorf("read verified finding run: %w", err)
+		return fmt.Errorf("read finding run: %w", err)
 	}
 	if status != domain.RunStatusAggregating {
 		return ErrRunNotAggregating
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM verified_findings WHERE run_id = ?`, runID); err != nil {
-		return fmt.Errorf("delete verified findings: %w", err)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM findings WHERE run_id = ?`, runID); err != nil {
+		return fmt.Errorf("delete findings: %w", err)
 	}
 	for _, finding := range findings {
 		if finding.RunID != runID {
-			return fmt.Errorf("verified finding %q belongs to another run", finding.ID)
+			return fmt.Errorf("finding %q belongs to another run", finding.ID)
 		}
 		if finding.CandidateID == "" && (finding.Confidence != domain.ConfidenceConfirmed || !strings.HasPrefix(finding.VerificationSource, "checker:")) {
-			return fmt.Errorf("verified finding %q is missing candidate", finding.ID)
+			return fmt.Errorf("finding %q is missing candidate", finding.ID)
 		}
 		evidenceJSON, err := json.Marshal(finding.Evidence)
 		if err != nil {
-			return fmt.Errorf("marshal verified evidence: %w", err)
+			return fmt.Errorf("marshal finding evidence: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO verified_findings (
+			INSERT INTO findings (
 				id, run_id, candidate_id, trace_id, fingerprint, confidence,
 				verification_source, verification_reason, category, severity, file_path,
 				line, title, explanation, evidence_json, suggestion, created_at
@@ -975,29 +975,29 @@ func (s *Store) ReplaceVerifiedFindings(ctx context.Context, runID string, findi
 			finding.Category, finding.Severity, finding.File, finding.Line, finding.Title,
 			finding.Explanation, string(evidenceJSON), finding.Suggestion, timeText(finding.CreatedAt),
 		); err != nil {
-			return fmt.Errorf("insert verified finding: %w", err)
+			return fmt.Errorf("insert finding: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit verified findings: %w", err)
+		return fmt.Errorf("commit findings: %w", err)
 	}
 	return nil
 }
 
-// ListVerifiedFindings 返回已分类、去重并可用于报告的最终 Finding。
-func (s *Store) ListVerifiedFindings(ctx context.Context, runID string) ([]domain.VerifiedFinding, error) {
+// ListFindings 返回已分类、去重并可用于报告的最终 Finding。
+func (s *Store) ListFindings(ctx context.Context, runID string) ([]domain.Finding, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, run_id, candidate_id, trace_id, fingerprint, confidence,
 		       verification_source, verification_reason, category, severity, file_path,
 		       line, title, explanation, evidence_json, suggestion, created_at
-		FROM verified_findings WHERE run_id = ? ORDER BY file_path, line, id`, runID)
+		FROM findings WHERE run_id = ? ORDER BY file_path, line, id`, runID)
 	if err != nil {
-		return nil, fmt.Errorf("list verified findings: %w", err)
+		return nil, fmt.Errorf("list findings: %w", err)
 	}
 	defer rows.Close()
-	var findings []domain.VerifiedFinding
+	var findings []domain.Finding
 	for rows.Next() {
-		var finding domain.VerifiedFinding
+		var finding domain.Finding
 		var candidateID sql.NullString
 		var evidenceJSON, createdAt string
 		if err := rows.Scan(
@@ -1007,22 +1007,22 @@ func (s *Store) ListVerifiedFindings(ctx context.Context, runID string) ([]domai
 			&finding.File, &finding.Line, &finding.Title, &finding.Explanation,
 			&evidenceJSON, &finding.Suggestion, &createdAt,
 		); err != nil {
-			return nil, fmt.Errorf("scan verified finding: %w", err)
+			return nil, fmt.Errorf("scan finding: %w", err)
 		}
 		if candidateID.Valid {
 			finding.CandidateID = candidateID.String
 		}
 		if err := json.Unmarshal([]byte(evidenceJSON), &finding.Evidence); err != nil {
-			return nil, fmt.Errorf("parse verified evidence: %w", err)
+			return nil, fmt.Errorf("parse finding evidence: %w", err)
 		}
 		finding.CreatedAt, err = parseTime(createdAt)
 		if err != nil {
-			return nil, fmt.Errorf("parse verified finding created_at: %w", err)
+			return nil, fmt.Errorf("parse finding created_at: %w", err)
 		}
 		findings = append(findings, finding)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate verified findings: %w", err)
+		return nil, fmt.Errorf("iterate findings: %w", err)
 	}
 	return findings, nil
 }

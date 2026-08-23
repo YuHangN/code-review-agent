@@ -170,14 +170,14 @@ func executeTrace(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintf(stderr, "get trace unit: %v\n", err)
 		return 1
 	}
-	findings, err := store.ListCandidateFindings(ctx, trace.RunID)
+	candidates, err := store.ListCandidateFindings(ctx, trace.RunID)
 	if err != nil {
 		fmt.Fprintf(stderr, "list trace findings: %v\n", err)
 		return 1
 	}
-	verified, err := store.ListVerifiedFindings(ctx, trace.RunID)
+	findings, err := store.ListFindings(ctx, trace.RunID)
 	if err != nil {
-		fmt.Fprintf(stderr, "list verified findings: %v\n", err)
+		fmt.Fprintf(stderr, "list findings: %v\n", err)
 		return 1
 	}
 	agentSteps, err := store.ListAgentSteps(ctx, trace.UnitID)
@@ -204,7 +204,7 @@ func executeTrace(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if trace.ErrorMessage != "" {
 		fmt.Fprintf(stdout, "error=%s\n", trace.ErrorMessage)
 	}
-	for _, finding := range findings {
+	for _, finding := range candidates {
 		if finding.TraceID != trace.ID {
 			continue
 		}
@@ -214,7 +214,7 @@ func executeTrace(ctx context.Context, args []string, stdout, stderr io.Writer) 
 			fmt.Fprintf(stdout, "evidence=%s\n", evidence)
 		}
 	}
-	for _, finding := range verified {
+	for _, finding := range findings {
 		if finding.TraceID != trace.ID {
 			continue
 		}

@@ -69,6 +69,33 @@ updated_at TEXT NOT NULL, UNIQUE(run_id, unit_key))`)
 	}
 }
 
+func TestOpenUsesFinalFindingsTableName(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "review.db")
+	store, err := sqlite.Open(ctx, path, sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	var current, legacy int
+	if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'findings'`).Scan(&current); err != nil {
+		t.Fatal(err)
+	}
+	if err := raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'verified_findings'`).Scan(&legacy); err != nil {
+		t.Fatal(err)
+	}
+	if current != 1 || legacy != 0 {
+		t.Fatalf("findings table=%d, legacy table=%d", current, legacy)
+	}
+}
+
 func TestStoreCreateRunPersistsUnitsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "review.db")
@@ -398,7 +425,7 @@ func TestAdvanceRunToAggregatingRequiresTerminalUnitsAndCurrentLease(t *testing.
 	}
 }
 
-func TestReplaceVerifiedFindingsIsAtomicAndIdempotent(t *testing.T) {
+func TestReplaceFindingsIsAtomicAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
 	if err != nil {
@@ -425,25 +452,25 @@ func TestReplaceVerifiedFindingsIsAtomicAndIdempotent(t *testing.T) {
 	if err := store.AdvanceRunToAggregating(ctx, run.ID, "worker-a", now.Add(3*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	finding := domain.VerifiedFinding{
+	finding := domain.Finding{
 		ID: "finding-verified", RunID: run.ID, CandidateID: candidate.ID, TraceID: trace.ID,
-		Fingerprint: "fingerprint-verified", Confidence: domain.ConfidenceConfirmed,
-		VerificationSource: "rule:test", VerificationReason: "确定性规则命中",
+		Fingerprint: "fingerprint-verified", Confidence: domain.ConfidenceAdvisory,
+		VerificationSource: "llm_reasoning_only", VerificationReason: "仅有模型推理证据",
 		Category: candidate.Category, Severity: candidate.Severity, File: candidate.File, Line: candidate.Line,
 		Title: candidate.Title, Explanation: candidate.Explanation, Evidence: []string{"规则证据"}, Suggestion: candidate.Suggestion, CreatedAt: now,
 	}
 
-	if err := store.ReplaceVerifiedFindings(ctx, run.ID, []domain.VerifiedFinding{finding}); err != nil {
+	if err := store.ReplaceFindings(ctx, run.ID, []domain.Finding{finding}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ReplaceVerifiedFindings(ctx, run.ID, []domain.VerifiedFinding{finding}); err != nil {
+	if err := store.ReplaceFindings(ctx, run.ID, []domain.Finding{finding}); err != nil {
 		t.Fatalf("idempotent replacement failed: %v", err)
 	}
-	findings, err := store.ListVerifiedFindings(ctx, run.ID)
+	findings, err := store.ListFindings(ctx, run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(findings) != 1 || findings[0].ID != finding.ID || findings[0].Confidence != domain.ConfidenceConfirmed || len(findings[0].Evidence) != 1 {
+	if len(findings) != 1 || findings[0].ID != finding.ID || findings[0].Confidence != domain.ConfidenceAdvisory || len(findings[0].Evidence) != 1 {
 		t.Fatalf("verified findings = %#v", findings)
 	}
 }

@@ -59,8 +59,8 @@ make checker-image
 - **可恢复**：Run 和 Review Unit 保存到 SQLite，重启后复用已经完成的工具和模型结果。
 - **预算限制**：每轮模型调用前预留费用，调用后按实际 token 结算；剩余预算不足时不发起调用并标记对应 Unit。
 - **Finding Trace**：每条评论能关联脱敏 diff、逐轮 Prompt、模型响应和工具结果。
-- **证据分级**：只有 EvidenceRule 或可信 Checker 提供确定性证据时才标记为高置信度；纯模型推理标记为仅供参考。
-- **双链路 Finding**：LLM Candidate 经 Verifier 分级；`go vet/staticcheck` 的新增行诊断直接成为高置信度 Finding，最终统一去重。
+- **证据分级**：可信 Checker 命中新增行时标记为高置信度；纯模型推理统一标记为仅供参考。
+- **双链路 Finding**：LLM Candidate 作为 advisory；`go vet/staticcheck` 的新增行诊断作为 confirmed，最终由 Aggregator 统一去重。
 - **安全边界**：Secret Scanner 在模型调用和内容落盘前运行；不执行测试、`go generate`、Makefile 或仓库脚本，静态检查只在受限 Docker 容器运行。
 - **可扩展工具**：工具通过统一接口和 YAML 注册，新增工具不修改 Review Workflow。
 - **平台适配**：主流程只依赖统一的 `ChangeRef + Adapter`；首版注册 GitHub，后续可在 Registry 中增加 GitLab 实现。
@@ -81,7 +81,7 @@ Reviewer 使用有边界的结构化 Tool-Calling Loop，不解析自由文本 R
 - `read_file` 只读取首次固定的 `head_sha`，拒绝路径穿越和敏感文件。
 - `search_symbol` 首版只搜索固定且已脱敏的 PR diff。
 - 每轮模型调用独立记账；恢复时复用已经完成的 Agent Step。
-- Verifier 不主动调用模型或工具，只复核 LLM Reviewer 的 Candidate，并读取已落盘的 diff 与工具证据做确定性分类。
+- Reviewer 只产出候选问题，不允许模型自行决定 confirmed；工具 Observation 作为脱敏 Trace 保留。
 
 ## Review 工作流
 
@@ -93,15 +93,15 @@ PR URL
   → Reviewer 按需调用受限工具并提出候选问题
   → Docker 沙箱对固定 head SHA 运行 go vet 和 staticcheck
   → 只保留命中 PR 新增行的 Checker Diagnostic
-  → Verifier 关联 diff 与工具证据，分类为 confirmed / advisory
+  → Aggregator 将 LLM Candidate 标为 advisory、Checker Diagnostic 标为 confirmed
   → 保存 checkpoint 和预算账本
   → 生成 Markdown 报告
 ```
 
 - **Workflow** 管理任务状态、恢复和步骤顺序。
 - **Reviewer** 通过结构化 Agent Loop 补充上下文并发现候选问题。
-- **Verifier** 只用确定性规则决定问题是否为高置信度。
-- **Checker** 对整个固定仓库做类型与静态分析，结果不经过 LLM Verifier。
+- **Checker** 对整个固定仓库做类型与静态分析，新增行诊断作为高置信度结果。
+- **Aggregator** 汇总 LLM 与 Checker 两条链路，确定性去重、排序并保存最终 Finding。
 - 每个 Unit 和 Agent Step 独立持久化；中断后只继续未完成部分。
 
 ## 项目结构
@@ -121,7 +121,7 @@ internal/
   review/                  Reviewer 与单个 Unit 的 checkpoint 处理
   checker/                 固定源码物化、Docker 沙箱、诊断解析与 checkpoint
   tools/                   声明式 Registry 与固定 Snapshot 工具
-  verifier/                Finding 证据校验和置信度分级
+  aggregation/             LLM 与 Checker Finding 的汇总、去重和排序
   report/                  Markdown 报告生成
   store/sqlite/            SQLite checkpoint 与账本
 config/                    运行时、模型和价格配置

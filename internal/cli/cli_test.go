@@ -159,7 +159,7 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	findings, err := store.ListVerifiedFindings(ctx, runID)
+	findings, err := store.ListFindings(ctx, runID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -51,7 +51,7 @@ type AgentStep struct {
 	CreatedAt   time.Time
 }
 
-// CandidateFindingRecord 是尚未经过 Verifier 的持久化候选问题。
+// CandidateFindingRecord 是尚待 Aggregator 汇总的持久化 LLM 候选问题。
 type CandidateFindingRecord struct {
 	ID          string
 	RunID       string
@@ -77,8 +77,8 @@ const (
 	ConfidenceAdvisory  Confidence = "advisory"
 )
 
-// VerifiedFinding 是完成证据分级和去重后可进入报告的统一最终问题。
-type VerifiedFinding struct {
+// Finding 是完成来源分级和去重后可进入报告的统一最终问题。
+type Finding struct {
 	ID                 string
 	RunID              string
 	CandidateID        string

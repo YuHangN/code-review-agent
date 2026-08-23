@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/aggregation"
 	"github.com/YuHangN/code-review-agent/internal/budget"
 	"github.com/YuHangN/code-review-agent/internal/checker"
 	"github.com/YuHangN/code-review-agent/internal/config"
@@ -26,7 +27,6 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/security"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 	reviewtools "github.com/YuHangN/code-review-agent/internal/tools"
-	"github.com/YuHangN/code-review-agent/internal/verifier"
 	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
 
@@ -285,7 +285,7 @@ func (application Application) execute(ctx context.Context, runID, owner, output
 		reviewer = review.NewRecoverableAgentReviewer(gateway, application.runtime.LLMFallbackOrder, application.runtime.MaxFindingsPerUnit, registry, agentLimits, application.store)
 	}
 	processor := review.NewUnitProcessor(application.store, reviewer, "llm_review", owner)
-	aggregator := verifier.NewAggregator(application.store, verifier.NewDefault())
+	aggregator := aggregation.New(application.store)
 	reporter := report.NewGenerator(application.store)
 	flow := workflow.New(application.store, processor, aggregator, reporter)
 	if application.runtime.Checkers.Enabled {

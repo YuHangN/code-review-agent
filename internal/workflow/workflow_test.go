@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/aggregation"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/report"
 	"github.com/YuHangN/code-review-agent/internal/review"
-	"github.com/YuHangN/code-review-agent/internal/verifier"
 	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
 
@@ -265,11 +265,11 @@ func (checker *workflowChecker) Process(context.Context, string, string, time.Ti
 	return nil
 }
 
-func (aggregator *workflowAggregator) Aggregate(context.Context, string, time.Time) (verifier.AggregatorResult, error) {
+func (aggregator *workflowAggregator) Aggregate(context.Context, string, time.Time) (aggregation.Result, error) {
 	if aggregator.events != nil {
 		*aggregator.events = append(*aggregator.events, "aggregate")
 	}
-	return verifier.AggregatorResult{Candidates: 1, Findings: 1, Advisory: 1}, nil
+	return aggregation.Result{Candidates: 1, Findings: 1, Advisory: 1}, nil
 }
 
 type workflowReporter struct {

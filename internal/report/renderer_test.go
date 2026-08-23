@@ -25,9 +25,9 @@ func TestRenderProducesDeterministicReviewReport(t *testing.T) {
 				{Name: "strong", SettledCalls: 2, ActualMicros: 300_000},
 			},
 		},
-		Findings: []domain.VerifiedFinding{
+		Findings: []domain.Finding{
 			{ID: "finding-advisory", TraceID: "trace-advisory", Confidence: domain.ConfidenceAdvisory, VerificationSource: "llm_reasoning_only", VerificationReason: "只有模型推理", Severity: "medium", File: "cache.go", Line: 8, Title: "共享 map 可能并发访问", Explanation: "可能发生竞态", Evidence: []string{"goroutine 写入 map"}, Suggestion: "检查同步方式"},
-			{ID: "finding-confirmed", TraceID: "trace-confirmed", Confidence: domain.ConfidenceConfirmed, VerificationSource: "rule:redacted_secret_assignment", VerificationReason: "规则确定性命中", Severity: "high", File: "config.yaml", Line: 2, Title: "配置中包含凭据", Explanation: "凭据写入源码", Evidence: []string{"Secret Scanner 命中"}, Suggestion: "改用密钥服务"},
+			{ID: "finding-confirmed", TraceID: "trace-confirmed", Confidence: domain.ConfidenceConfirmed, VerificationSource: "checker:staticcheck", VerificationReason: "确定性静态检查器命中", Severity: "high", File: "config.yaml", Line: 2, Title: "配置中包含凭据", Explanation: "凭据写入源码", Evidence: []string{"staticcheck 命中"}, Suggestion: "改用密钥服务"},
 		},
 	}
 
@@ -53,7 +53,7 @@ func TestRenderProducesDeterministicReviewReport(t *testing.T) {
 		"Checker：go_vet=completed（1 次），staticcheck=completed（1 次）",
 		"## 高置信度，可直接采纳（1）",
 		"config.yaml:2",
-		"rule:redacted_secret_assignment",
+		"checker:staticcheck",
 		"trace-confirmed",
 		"## 仅供参考（1）",
 		"cache.go:8",

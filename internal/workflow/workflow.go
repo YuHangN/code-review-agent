@@ -8,10 +8,10 @@ import (
 	"sort"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/aggregation"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/report"
 	"github.com/YuHangN/code-review-agent/internal/review"
-	"github.com/YuHangN/code-review-agent/internal/verifier"
 )
 
 var (
@@ -39,9 +39,9 @@ type CheckerProcessor interface {
 	Process(ctx context.Context, runID, owner string, now time.Time) error
 }
 
-// FindingAggregator 验证、去重并保存最终 Finding。
+// FindingAggregator 汇总、去重并保存最终 Finding。
 type FindingAggregator interface {
-	Aggregate(ctx context.Context, runID string, now time.Time) (verifier.AggregatorResult, error)
+	Aggregate(ctx context.Context, runID string, now time.Time) (aggregation.Result, error)
 }
 
 // ReportGenerator 生成或恢复权威 Markdown 报告。
@@ -77,7 +77,7 @@ type UnitSummary struct {
 type Result struct {
 	Status      domain.RunStatus
 	Units       UnitSummary
-	Aggregation verifier.AggregatorResult
+	Aggregation aggregation.Result
 	Report      report.GenerateResult
 }
 

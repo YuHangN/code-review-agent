@@ -26,7 +26,7 @@ var (
 
 var hunkHeaderPattern = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 
-// CandidateFinding 是等待 Verifier 复核的候选问题，不代表最终结论。
+// CandidateFinding 是等待 Aggregator 汇总的模型候选问题，不代表最终结论。
 type CandidateFinding struct {
 	Category    string   `json:"category"`
 	Severity    string   `json:"severity"`
@@ -114,7 +114,7 @@ func NewRecoverableAgentReviewer(caller Caller, tierOrder []string, maxFindings 
 	return Reviewer{caller: caller, tierOrder: append([]string(nil), tierOrder...), maxFindings: maxFindings, registry: registry, limits: limits, checkpoint: checkpoint}
 }
 
-// Review 只产生 Candidate Finding；证据确认和置信度分类由 Verifier 完成。
+// Review 只产生 Candidate Finding；Aggregator 会将它们统一标记为 advisory。
 func (reviewer Reviewer) Review(ctx context.Context, request Request) (Result, error) {
 	if reviewer.caller == nil || len(reviewer.tierOrder) == 0 || reviewer.maxFindings <= 0 || request.CallID == "" || request.Unit.ID == "" || request.Unit.RunID == "" || request.Unit.FilePath == "" || strings.TrimSpace(request.Diff) == "" {
 		return Result{}, ErrInvalidRequest

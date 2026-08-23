@@ -24,7 +24,7 @@ type Store interface {
 	GetRun(ctx context.Context, runID string) (domain.Run, error)
 	GetSnapshot(ctx context.Context, runID string) (domain.ChangeSnapshot, error)
 	ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error)
-	ListVerifiedFindings(ctx context.Context, runID string) ([]domain.VerifiedFinding, error)
+	ListFindings(ctx context.Context, runID string) ([]domain.Finding, error)
 	BudgetSummary(ctx context.Context, runID string) (budget.Summary, error)
 	SaveReport(ctx context.Context, report domain.Report, now time.Time) error
 	GetReport(ctx context.Context, runID string) (domain.Report, error)
@@ -78,7 +78,7 @@ func (generator Generator) Generate(ctx context.Context, request GenerateRequest
 	if err != nil {
 		return GenerateResult{}, fmt.Errorf("list report units: %w", err)
 	}
-	findings, err := generator.store.ListVerifiedFindings(ctx, run.ID)
+	findings, err := generator.store.ListFindings(ctx, run.ID)
 	if err != nil {
 		return GenerateResult{}, fmt.Errorf("list report findings: %w", err)
 	}

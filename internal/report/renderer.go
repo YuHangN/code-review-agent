@@ -19,7 +19,7 @@ type Input struct {
 	Snapshot domain.ChangeSnapshot
 	Units    []domain.ReviewUnit
 	Checkers []domain.CheckerRun
-	Findings []domain.VerifiedFinding
+	Findings []domain.Finding
 	Budget   budget.Summary
 }
 
@@ -73,8 +73,8 @@ func formatTierUsage(tiers []budget.TierSummary) string {
 	return strings.Join(items, "，")
 }
 
-func splitAndSortFindings(findings []domain.VerifiedFinding) ([]domain.VerifiedFinding, []domain.VerifiedFinding) {
-	var confirmed, advisory []domain.VerifiedFinding
+func splitAndSortFindings(findings []domain.Finding) ([]domain.Finding, []domain.Finding) {
+	var confirmed, advisory []domain.Finding
 	for _, finding := range findings {
 		if finding.Confidence == domain.ConfidenceConfirmed {
 			confirmed = append(confirmed, finding)
@@ -87,7 +87,7 @@ func splitAndSortFindings(findings []domain.VerifiedFinding) ([]domain.VerifiedF
 	return confirmed, advisory
 }
 
-func sortFindings(findings []domain.VerifiedFinding) {
+func sortFindings(findings []domain.Finding) {
 	sort.Slice(findings, func(i, j int) bool {
 		if findings[i].File != findings[j].File {
 			return findings[i].File < findings[j].File
@@ -111,7 +111,7 @@ func unitCoverage(units []domain.ReviewUnit) (completed, skippedBudget int) {
 	return completed, skippedBudget
 }
 
-func renderFindingSection(output *strings.Builder, title string, findings []domain.VerifiedFinding) {
+func renderFindingSection(output *strings.Builder, title string, findings []domain.Finding) {
 	fmt.Fprintf(output, "\n## %s（%d）\n\n", title, len(findings))
 	if len(findings) == 0 {
 		fmt.Fprintln(output, "无。")
