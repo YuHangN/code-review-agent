@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/domain"
+	"github.com/YuHangN/code-review-agent/internal/planner"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 )
 
@@ -179,6 +180,33 @@ func TestSaveFetchedSnapshotRejectsIncompleteSnapshotWithoutAdvancingRun(t *test
 	}
 	if _, getErr := store.GetSnapshot(ctx, run.ID); getErr == nil {
 		t.Fatal("incomplete snapshot was persisted")
+	}
+}
+
+func TestSavePlanAllowsDifferentRunsForSameSnapshotHunk(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Date(2026, 8, 23, 5, 30, 0, 0, time.UTC)
+	diff := "diff --git a/main.go b/main.go\n@@ -0,0 +1 @@\n+package main\n"
+	var unitIDs []string
+	for _, runID := range []string{"run-a", "run-b"} {
+		run := domain.Run{
+			ID: runID, SourceURL: "https://github.com/acme/repo/pull/1",
+			Provider: "github", Repository: "acme/repo", ChangeNumber: 1,
+			Status: domain.RunStatusFetched, BudgetLimitMicros: 1_000_000,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := store.CreateRun(ctx, run, nil); err != nil {
+			t.Fatal(err)
+		}
+		units := planner.New().Plan(planner.Request{RunID: runID, HeadSHA: "same-head", Diff: diff, Now: now})
+		if err := store.SavePlan(ctx, runID, units, now); err != nil {
+			t.Fatalf("save plan for %s: %v", runID, err)
+		}
+		unitIDs = append(unitIDs, units[0].ID)
+	}
+	if unitIDs[0] == unitIDs[1] {
+		t.Fatalf("different runs persisted the same Unit ID %q", unitIDs[0])
 	}
 }
 

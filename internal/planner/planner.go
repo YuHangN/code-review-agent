@@ -62,8 +62,9 @@ func (Planner) Plan(request Request) []domain.ReviewUnit {
 func newUnit(request Request, filePath string, start, end int, content string) domain.ReviewUnit {
 	keyInput := fmt.Sprintf("%s\x00%s\x00%d-%d", request.HeadSHA, filePath, start, end)
 	key := fmt.Sprintf("%x", sha256.Sum256([]byte(keyInput)))
+	idHash := sha256.Sum256([]byte(request.RunID + "\x00" + key))
 	return domain.ReviewUnit{
-		ID:        "unit-" + key[:16],
+		ID:        fmt.Sprintf("unit-%x", idHash[:16]),
 		RunID:     request.RunID,
 		UnitKey:   key,
 		FilePath:  filePath,

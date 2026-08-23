@@ -7,10 +7,10 @@
 ## 计划用法
 
 ```bash
-review-agent run https://github.com/acme/payments/pull/42 \
-  --budget-cents 1000 \
+review-agent run --budget-cents 1000 \
   --tools-config config/tools.yaml \
-  --output out/report.md
+  --output out/report.md \
+  https://github.com/acme/payments/pull/42
 
 review-agent resume <run-id> --output out/report.md
 review-agent status <run-id>
@@ -23,6 +23,25 @@ review-agent trace <trace-id>
 - `trace`：查看某条 Finding 使用的 diff、工具和模型证据。
 
 真实 `run/resume` 从 `GITHUB_TOKEN` 和 `OPENAI_API_KEY` 环境变量读取凭据；凭据不会写入配置、SQLite、Trace 或报告。模型、价格和请求超时位于 `config/runtime.yaml`，Agent 上限和工具声明位于 `config/tools.yaml`。
+
+## 整体链路框架
+
+```text
+用户执行 run
+  → main 把命令参数交给 CLI
+  → CLI 识别 run，并解析 PR URL、预算和输出路径
+  → 读取 runtime.yaml，打开 SQLite 并检查数据库版本
+  → 写入 created Run，立即向用户输出 run_id
+  → Run 进入 fetching，GitHub Adapter 获取 base/head SHA 和 diff
+  → Security 排除敏感文件并脱敏 diff
+  → 原子保存 Snapshot，Run 进入 fetched
+  → Planner 按文件和 diff hunk 切分 Review Unit，并跳过低价值文件
+  → UnitKey 标识稳定的代码位置，UnitID 绑定当前 Run
+  → 根据鉴权、SQL、并发和配置等关键词标记风险
+  → 原子保存全部 Review Unit，Run 进入 planned
+```
+
+如果 Fetch 中断，数据库会保留 `fetching` 状态，可使用已有的 `run_id` 继续；进入 `fetched` 后，本次 Review 始终使用已经保存的 Snapshot。规划中断时会从 Snapshot 重新生成相同的 Unit，进入 `planned` 后则直接复用数据库中的计划。
 
 ## 设计重点
 

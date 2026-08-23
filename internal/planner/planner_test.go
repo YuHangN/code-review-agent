@@ -36,3 +36,20 @@ func TestPlanSkipsSecurityExcludedFileBlocks(t *testing.T) {
 		t.Fatalf("units = %#v, want only main.go", units)
 	}
 }
+
+func TestPlanScopesUnitIDToRunWhileKeepingStableUnitKey(t *testing.T) {
+	diff := "diff --git a/main.go b/main.go\n@@ -0,0 +1 @@\n+package main\n"
+	now := time.Date(2026, 8, 23, 5, 0, 0, 0, time.UTC)
+	first := planner.New().Plan(planner.Request{RunID: "run-a", HeadSHA: "same-head", Diff: diff, Now: now})
+	second := planner.New().Plan(planner.Request{RunID: "run-b", HeadSHA: "same-head", Diff: diff, Now: now})
+
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("unit counts = %d and %d, want one each", len(first), len(second))
+	}
+	if first[0].UnitKey != second[0].UnitKey {
+		t.Fatalf("same change UnitKeys differ: %q and %q", first[0].UnitKey, second[0].UnitKey)
+	}
+	if first[0].ID == second[0].ID {
+		t.Fatalf("different runs share Unit ID %q", first[0].ID)
+	}
+}
