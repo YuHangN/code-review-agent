@@ -179,7 +179,7 @@ func (application Application) Resume(ctx context.Context, request ResumeRequest
 	providers := inactiveProviders(application.runtime.LLMTiers)
 	var registry *reviewtools.Registry
 	var agentLimits reviewtools.AgentLimits
-	if run.Status == domain.RunStatusPlanned || run.Status == domain.RunStatusReviewing {
+	if run.Status == domain.RunStatusPlanned || run.Status == domain.RunStatusChecking || run.Status == domain.RunStatusReviewing {
 		providers, err = application.providers()
 		if err != nil {
 			return workflow.Result{}, fmt.Errorf("configure LLM providers: %w", err)

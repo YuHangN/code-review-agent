@@ -35,8 +35,9 @@ func TestWorkflowContinuesPlannedRunThroughReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantEvents := []string{
+		"claim", "checking", "check", "reviewing", "release",
 		"claim", "process:high-a", "process:high-b", "process:medium", "process:low",
-		"checking", "release", "claim", "check", "aggregating", "release", "aggregate", "report",
+		"aggregating", "release", "aggregate", "report",
 	}
 	if !reflect.DeepEqual(store.events, wantEvents) {
 		t.Fatalf("events = %v, want %v", store.events, wantEvents)
@@ -51,7 +52,7 @@ func TestWorkflowContinuesPlannedRunThroughReport(t *testing.T) {
 
 func TestWorkflowKeepsReviewingWhenAUnitFailsRecoverably(t *testing.T) {
 	reviewErr := errors.New("model unavailable")
-	store := newWorkflowStore(domain.RunStatusPlanned, []domain.ReviewUnit{
+	store := newWorkflowStore(domain.RunStatusReviewing, []domain.ReviewUnit{
 		{ID: "high", UnitKey: "a", Risk: "high", Status: domain.UnitStatusPending},
 		{ID: "low", UnitKey: "b", Risk: "low", Status: domain.UnitStatusPending},
 	})
@@ -110,7 +111,7 @@ func TestWorkflowRestoresReportedRunWithoutEarlierStages(t *testing.T) {
 
 func TestWorkflowReleasesLeaseWhenLoadingUnitsFails(t *testing.T) {
 	listErr := errors.New("database unavailable")
-	store := newWorkflowStore(domain.RunStatusPlanned, nil)
+	store := newWorkflowStore(domain.RunStatusReviewing, nil)
 	store.listErr = listErr
 	flow := workflow.New(store, &workflowProcessor{}, &workflowAggregator{}, &workflowReporter{})
 
@@ -124,7 +125,7 @@ func TestWorkflowReleasesLeaseWhenLoadingUnitsFails(t *testing.T) {
 }
 
 func TestWorkflowRenewsLeaseWhileAUnitIsRunning(t *testing.T) {
-	store := newWorkflowStore(domain.RunStatusPlanned, []domain.ReviewUnit{
+	store := newWorkflowStore(domain.RunStatusReviewing, []domain.ReviewUnit{
 		{ID: "slow", UnitKey: "a", Risk: "high", Status: domain.UnitStatusPending},
 	})
 	store.renewed = make(chan struct{})
@@ -143,7 +144,7 @@ func TestWorkflowRenewsLeaseWhileAUnitIsRunning(t *testing.T) {
 
 func TestWorkflowStopsWhenLeaseRenewalFails(t *testing.T) {
 	renewErr := errors.New("lease taken over")
-	store := newWorkflowStore(domain.RunStatusPlanned, []domain.ReviewUnit{
+	store := newWorkflowStore(domain.RunStatusReviewing, []domain.ReviewUnit{
 		{ID: "slow", UnitKey: "a", Risk: "high", Status: domain.UnitStatusPending},
 	})
 	store.renewed = make(chan struct{})
@@ -205,9 +206,6 @@ func (store *workflowStore) ClaimRun(_ context.Context, _ string, _ string, _ ti
 	}
 	store.active = true
 	store.events = append(store.events, "claim")
-	if store.run.Status != domain.RunStatusChecking {
-		store.run.Status = domain.RunStatusReviewing
-	}
 	return store.run, nil
 }
 
@@ -221,7 +219,13 @@ func (store *workflowStore) AdvanceRunToChecking(context.Context, string, string
 	return nil
 }
 
-func (store *workflowStore) AdvanceCheckingToAggregating(context.Context, string, string, time.Time) error {
+func (store *workflowStore) AdvanceCheckingToReviewing(context.Context, string, string, time.Time) error {
+	store.events = append(store.events, "reviewing")
+	store.run.Status = domain.RunStatusReviewing
+	return nil
+}
+
+func (store *workflowStore) AdvanceRunToAggregating(context.Context, string, string, time.Time) error {
 	store.events = append(store.events, "aggregating")
 	store.run.Status = domain.RunStatusAggregating
 	return nil

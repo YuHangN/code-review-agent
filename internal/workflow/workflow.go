@@ -25,7 +25,8 @@ type StateStore interface {
 	ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error)
 	ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error)
 	AdvanceRunToChecking(ctx context.Context, runID, owner string, now time.Time) error
-	AdvanceCheckingToAggregating(ctx context.Context, runID, owner string, now time.Time) error
+	AdvanceCheckingToReviewing(ctx context.Context, runID, owner string, now time.Time) error
+	AdvanceRunToAggregating(ctx context.Context, runID, owner string, now time.Time) error
 	ReleaseRunLease(ctx context.Context, runID, owner string) error
 }
 
@@ -108,17 +109,17 @@ func (workflow Workflow) Execute(ctx context.Context, request ExecuteRequest) (R
 			return result, fmt.Errorf("get workflow run: %w", err)
 		}
 		switch run.Status {
-		case domain.RunStatusPlanned, domain.RunStatusReviewing:
-			result.Units, err = workflow.processUnits(ctx, request)
-			if err != nil {
-				return result, fmt.Errorf("process review units: %w", err)
-			}
-		case domain.RunStatusChecking:
+		case domain.RunStatusPlanned, domain.RunStatusChecking:
 			if workflow.checker == nil {
 				return result, fmt.Errorf("%w: checker stage is not configured", ErrWorkflowState)
 			}
 			if err = workflow.processCheckers(ctx, request); err != nil {
 				return result, fmt.Errorf("process checkers: %w", err)
+			}
+		case domain.RunStatusReviewing:
+			result.Units, err = workflow.processUnits(ctx, request)
+			if err != nil {
+				return result, fmt.Errorf("process review units: %w", err)
 			}
 		case domain.RunStatusAggregating:
 			result.Aggregation, err = workflow.aggregator.Aggregate(ctx, request.RunID, time.Now().UTC())
@@ -196,8 +197,8 @@ func (workflow Workflow) processUnits(ctx context.Context, request ExecuteReques
 	if err := waitForLease(leaseErrors); err != nil {
 		return summary, err
 	}
-	if err := workflow.store.AdvanceRunToChecking(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
-		return summary, fmt.Errorf("advance run to checking: %w", err)
+	if err := workflow.store.AdvanceRunToAggregating(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
+		return summary, fmt.Errorf("advance run to aggregating: %w", err)
 	}
 	return summary, nil
 }
@@ -205,6 +206,10 @@ func (workflow Workflow) processUnits(ctx context.Context, request ExecuteReques
 func (workflow Workflow) processCheckers(ctx context.Context, request ExecuteRequest) (resultErr error) {
 	if _, err := workflow.store.ClaimRun(ctx, request.RunID, request.Owner, time.Now().UTC(), request.Lease.TTL); err != nil {
 		return fmt.Errorf("claim run: %w", err)
+	}
+	if err := workflow.store.AdvanceRunToChecking(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
+		_ = workflow.store.ReleaseRunLease(context.WithoutCancel(ctx), request.RunID, request.Owner)
+		return fmt.Errorf("advance run to checking: %w", err)
 	}
 	leaseCtx, stopLease := context.WithCancel(ctx)
 	leaseErrors := workflow.maintainLease(leaseCtx, request)
@@ -224,8 +229,8 @@ func (workflow Workflow) processCheckers(ctx context.Context, request ExecuteReq
 	if err := waitForLease(leaseErrors); err != nil {
 		return err
 	}
-	if err := workflow.store.AdvanceCheckingToAggregating(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
-		return fmt.Errorf("advance checking to aggregating: %w", err)
+	if err := workflow.store.AdvanceCheckingToReviewing(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
+		return fmt.Errorf("advance checking to reviewing: %w", err)
 	}
 	return nil
 }

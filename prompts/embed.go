@@ -24,10 +24,11 @@ var agentReviewTemplate = template.Must(
 
 // ReviewData 是 Reviewer Prompt 中允许注入的结构化变量。
 type ReviewData struct {
-	MaxFindings int
-	FilePath    string
-	Risk        string
-	Diff        string
+	MaxFindings      int
+	FilePath         string
+	Risk             string
+	Diff             string
+	KnownDiagnostics string
 }
 
 // AgentReviewData 在基础 Review 输入上增加 Registry 已授权的工具定义。

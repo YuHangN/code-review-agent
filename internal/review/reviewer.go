@@ -44,12 +44,22 @@ type Rejection struct {
 	Reason string
 }
 
+// KnownDiagnostic 是 Reviewer 去重提示所需的最小 Checker 诊断视图。
+type KnownDiagnostic struct {
+	Checker string `json:"checker"`
+	Code    string `json:"code"`
+	File    string `json:"file"`
+	Line    int    `json:"line"`
+	Message string `json:"message"`
+}
+
 // Request 包含一次 Unit 审查需要的身份和脱敏 diff。
 type Request struct {
-	CallID string
-	Owner  string
-	Unit   domain.ReviewUnit
-	Diff   string
+	CallID           string
+	Owner            string
+	Unit             domain.ReviewUnit
+	Diff             string
+	KnownDiagnostics []KnownDiagnostic
 }
 
 // Result 保留 Prompt 和原始模型回复，供后续 finding trace 使用。
@@ -120,7 +130,7 @@ func (reviewer Reviewer) Review(ctx context.Context, request Request) (Result, e
 		return Result{}, ErrInvalidRequest
 	}
 	sanitizedInput := security.NewSanitizer().SanitizeSnapshot(domain.ChangeSnapshot{Diff: request.Diff})
-	prompt, err := reviewer.buildPrompt(request.Unit, sanitizedInput.Snapshot.Diff)
+	prompt, err := reviewer.buildPrompt(request.Unit, sanitizedInput.Snapshot.Diff, request.KnownDiagnostics)
 	if err != nil {
 		return Result{}, err
 	}
@@ -300,16 +310,20 @@ func (reviewer Reviewer) validateFindings(result *Result, unit domain.ReviewUnit
 	}
 }
 
-func (reviewer Reviewer) buildPrompt(unit domain.ReviewUnit, diff string) (string, error) {
+func (reviewer Reviewer) buildPrompt(unit domain.ReviewUnit, diff string, diagnostics []KnownDiagnostic) (string, error) {
+	knownDiagnostics, err := encodeKnownDiagnostics(diagnostics)
+	if err != nil {
+		return "", err
+	}
 	if reviewer.registry == nil {
-		return buildPrompt(unit, diff, reviewer.maxFindings)
+		return buildPrompt(unit, diff, knownDiagnostics, reviewer.maxFindings)
 	}
 	definitionsJSON, err := json.Marshal(reviewer.registry.Definitions())
 	if err != nil {
 		return "", fmt.Errorf("encode tool definitions: %w", err)
 	}
 	prompt, err := prompts.RenderAgentReview(prompts.AgentReviewData{
-		ReviewData:      prompts.ReviewData{MaxFindings: reviewer.maxFindings, FilePath: unit.FilePath, Risk: unit.Risk, Diff: diff},
+		ReviewData:      prompts.ReviewData{MaxFindings: reviewer.maxFindings, FilePath: unit.FilePath, Risk: unit.Risk, Diff: diff, KnownDiagnostics: knownDiagnostics},
 		ToolDefinitions: string(definitionsJSON),
 	})
 	if err != nil {
@@ -425,15 +439,34 @@ func hasRequiredFields(finding CandidateFinding) bool {
 	return false
 }
 
-func buildPrompt(unit domain.ReviewUnit, diff string, maxFindings int) (string, error) {
+func buildPrompt(unit domain.ReviewUnit, diff, knownDiagnostics string, maxFindings int) (string, error) {
 	prompt, err := prompts.RenderReview(prompts.ReviewData{
-		MaxFindings: maxFindings,
-		FilePath:    unit.FilePath,
-		Risk:        unit.Risk,
-		Diff:        diff,
+		MaxFindings:      maxFindings,
+		FilePath:         unit.FilePath,
+		Risk:             unit.Risk,
+		Diff:             diff,
+		KnownDiagnostics: knownDiagnostics,
 	})
 	if err != nil {
 		return "", fmt.Errorf("render reviewer prompt: %w", err)
 	}
 	return prompt, nil
+}
+
+func encodeKnownDiagnostics(diagnostics []KnownDiagnostic) (string, error) {
+	if len(diagnostics) == 0 {
+		return "", nil
+	}
+	sanitized := make([]KnownDiagnostic, len(diagnostics))
+	for index, diagnostic := range diagnostics {
+		sanitized[index] = KnownDiagnostic{
+			Checker: sanitizeText(diagnostic.Checker), Code: sanitizeText(diagnostic.Code),
+			File: sanitizeText(diagnostic.File), Line: diagnostic.Line, Message: sanitizeText(diagnostic.Message),
+		}
+	}
+	encoded, err := json.Marshal(sanitized)
+	if err != nil {
+		return "", fmt.Errorf("encode known checker diagnostics: %w", err)
+	}
+	return string(encoded), nil
 }

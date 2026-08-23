@@ -15,7 +15,7 @@ var (
 	hunkPattern       = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 )
 
-// ParsedDiagnostic 是尚未持久化的可信工具诊断。
+// ParsedDiagnostic 是尚未持久化的不可信 Checker 输出，进入其他边界前仍需脱敏和编码。
 type ParsedDiagnostic struct {
 	UnitID  string
 	File    string

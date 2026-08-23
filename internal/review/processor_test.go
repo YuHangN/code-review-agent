@@ -69,6 +69,21 @@ func TestUnitProcessorCompletesUnitAndPersistsCandidatesWithTrace(t *testing.T) 
 	}
 }
 
+func TestUnitProcessorPassesUnitCheckerDiagnosticsToReviewer(t *testing.T) {
+	ctx := context.Background()
+	store := processorStoreWithCheckerDiagnostic(t)
+	reviewer := &stubReviewer{result: review.Result{Prompt: "prompt", RawResponse: `{"findings":[]}`}}
+	processor := review.NewUnitProcessor(store, reviewer, "llm_review", "worker-a")
+
+	if _, err := processor.Process(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := reviewer.request.KnownDiagnostics
+	if len(diagnostics) != 1 || diagnostics[0].Checker != "staticcheck" || diagnostics[0].Code != "SA5009" {
+		t.Fatalf("checker diagnostics = %#v", diagnostics)
+	}
+}
+
 func TestUnitProcessorCheckpointsRecoverableReviewerFailure(t *testing.T) {
 	ctx := context.Background()
 	store := processorStore(t)
@@ -221,12 +236,51 @@ func processorStore(t *testing.T) *sqlite.Store {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	now := time.Date(2026, 8, 22, 2, 0, 0, 0, time.UTC)
-	run := domain.Run{ID: "run-001", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	run := domain.Run{ID: "run-001", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusReviewing, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
 	unit := domain.ReviewUnit{ID: "unit-001", RunID: run.ID, UnitKey: "key-001", FilePath: "cache.go", StartLine: 12, EndLine: 12, DiffHunk: "@@ -10 +12 @@\n+cache[key] = value\n", Risk: "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}
 	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, 2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func processorStoreWithCheckerDiagnostic(t *testing.T) *sqlite.Store {
+	t.Helper()
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	now := time.Date(2026, 8, 22, 2, 0, 0, 0, time.UTC)
+	run := domain.Run{ID: "run-001", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	unit := domain.ReviewUnit{ID: "unit-001", RunID: run.ID, UnitKey: "key-001", FilePath: "cache.go", StartLine: 12, EndLine: 12, DiffHunk: "@@ -10 +12 @@\n+fmt.Printf(\"%d\", name)\n", Risk: "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, 2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceRunToChecking(ctx, run.ID, "worker-a", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureCheckerRuns(ctx, run.ID, []string{"staticcheck"}, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	checkerRun, err := store.ClaimCheckerRun(ctx, run.ID, "staticcheck", "worker-a", now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := domain.CheckerDiagnostic{ID: "diagnostic-001", RunID: run.ID, CheckerRunID: checkerRun.ID, UnitID: unit.ID, TraceID: "trace-checker-001", Checker: "staticcheck", File: "cache.go", Line: 12, Column: 1, Code: "SA5009", Message: "Printf format mismatch", Severity: "high", CreatedAt: now}
+	trace := domain.ReviewTrace{ID: diagnostic.TraceID, RunID: run.ID, UnitID: unit.ID, CallID: "checker-call-001", Detector: "checker:staticcheck", Status: "completed", Response: `{"code":"SA5009"}`, CreatedAt: now}
+	checkerRun.Command = []string{"staticcheck", "./..."}
+	if err := store.CompleteCheckerRun(ctx, checkerRun, []domain.CheckerDiagnostic{diagnostic}, []domain.ReviewTrace{trace}, "worker-a", now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdvanceCheckingToReviewing(ctx, run.ID, "worker-a", now.Add(5*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	return store

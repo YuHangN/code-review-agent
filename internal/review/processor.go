@@ -20,6 +20,7 @@ type UnitReviewer interface {
 // UnitStore 是一次 Unit checkpoint 所需的最小持久化能力。
 type UnitStore interface {
 	StartReviewUnit(ctx context.Context, unitID, owner string, now time.Time) (domain.ReviewUnit, error)
+	ListCheckerDiagnosticsForUnit(ctx context.Context, runID, unitID string) ([]domain.CheckerDiagnostic, error)
 	CompleteReviewUnit(ctx context.Context, trace domain.ReviewTrace, findings []domain.CandidateFindingRecord, owner string, now time.Time) error
 	FinishReviewUnit(ctx context.Context, trace domain.ReviewTrace, status domain.UnitStatus, owner string, now time.Time) error
 }
@@ -53,8 +54,15 @@ func (processor UnitProcessor) Process(ctx context.Context, unitID string, now t
 	if err != nil {
 		return UnitOutcome{}, fmt.Errorf("start review unit: %w", err)
 	}
+	diagnostics, err := processor.store.ListCheckerDiagnosticsForUnit(ctx, unit.RunID, unit.ID)
+	if err != nil {
+		return UnitOutcome{}, fmt.Errorf("list checker diagnostics: %w", err)
+	}
 	callID := fmt.Sprintf("call-%s-%d", unit.ID, unit.Attempt)
-	result, err := processor.reviewer.Review(ctx, Request{CallID: callID, Owner: processor.owner, Unit: unit, Diff: unit.DiffHunk})
+	result, err := processor.reviewer.Review(ctx, Request{
+		CallID: callID, Owner: processor.owner, Unit: unit, Diff: unit.DiffHunk,
+		KnownDiagnostics: toKnownDiagnostics(diagnostics),
+	})
 	traceID := fmt.Sprintf("trace-%s-%d", unit.ID, unit.Attempt)
 	if err != nil {
 		status := domain.UnitStatusFailedRecoverable
@@ -98,6 +106,17 @@ func (processor UnitProcessor) Process(ctx context.Context, unitID string, now t
 		return UnitOutcome{}, fmt.Errorf("complete review unit: %w", err)
 	}
 	return UnitOutcome{UnitID: unit.ID, Status: domain.UnitStatusCompleted, TraceID: traceID, FindingCount: len(findings)}, nil
+}
+
+func toKnownDiagnostics(diagnostics []domain.CheckerDiagnostic) []KnownDiagnostic {
+	result := make([]KnownDiagnostic, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
+		result = append(result, KnownDiagnostic{
+			Checker: diagnostic.Checker, Code: diagnostic.Code, File: diagnostic.File,
+			Line: diagnostic.Line, Message: diagnostic.Message,
+		})
+	}
+	return result
 }
 
 func sanitizeEvidence(evidence []string) []string {

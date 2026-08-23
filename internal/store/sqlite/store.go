@@ -329,9 +329,9 @@ func (s *Store) StartReviewUnit(ctx context.Context, unitID, owner string, now t
 	result, err = tx.ExecContext(ctx, `
 		UPDATE runs SET status = ?, updated_at = ?
 		WHERE id = (SELECT run_id FROM review_units WHERE id = ?)
-		  AND status IN (?, ?)`,
+		  AND status = ?`,
 		domain.RunStatusReviewing, timeText(now), unitID,
-		domain.RunStatusPlanned, domain.RunStatusReviewing,
+		domain.RunStatusReviewing,
 	)
 	if err != nil {
 		return domain.ReviewUnit{}, fmt.Errorf("start reviewing run: %w", err)
@@ -579,10 +579,24 @@ func (s *Store) ListCheckerRuns(ctx context.Context, runID string) ([]domain.Che
 
 // ListCheckerDiagnostics 返回可以在聚合阶段转换为最终 Finding 的确定性诊断。
 func (s *Store) ListCheckerDiagnostics(ctx context.Context, runID string) ([]domain.CheckerDiagnostic, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return s.queryCheckerDiagnostics(ctx, `
 		SELECT id, run_id, checker_run_id, unit_id, trace_id, checker, file_path,
 		       line, column_number, diagnostic_code, message, severity, created_at
 		FROM checker_diagnostics WHERE run_id = ? ORDER BY file_path, line, checker, id`, runID)
+}
+
+// ListCheckerDiagnosticsForUnit 只返回当前 Run、当前 Unit 的诊断，避免 Reviewer 接触其他 Unit 的结果。
+func (s *Store) ListCheckerDiagnosticsForUnit(ctx context.Context, runID, unitID string) ([]domain.CheckerDiagnostic, error) {
+	return s.queryCheckerDiagnostics(ctx, `
+		SELECT id, run_id, checker_run_id, unit_id, trace_id, checker, file_path,
+		       line, column_number, diagnostic_code, message, severity, created_at
+		FROM checker_diagnostics
+		WHERE run_id = ? AND unit_id = ?
+		ORDER BY file_path, line, checker, id`, runID, unitID)
+}
+
+func (s *Store) queryCheckerDiagnostics(ctx context.Context, query string, arguments ...any) ([]domain.CheckerDiagnostic, error) {
+	rows, err := s.db.QueryContext(ctx, query, arguments...)
 	if err != nil {
 		return nil, fmt.Errorf("list checker diagnostics: %w", err)
 	}
@@ -640,14 +654,14 @@ func (s *Store) FinishReviewUnit(ctx context.Context, trace domain.ReviewTrace, 
 	return nil
 }
 
-// AdvanceRunToChecking 在当前 lease 仍有效且所有 Unit 都是终态时进入仓库级检查阶段。
+// AdvanceRunToChecking 在当前 lease 仍有效时优先进入仓库级检查阶段。
+// checking 允许重复写入，保证该阶段可以从 checkpoint 恢复。
 func (s *Store) AdvanceRunToChecking(ctx context.Context, runID, owner string, now time.Time) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET status = ?, updated_at = ?
-		WHERE id = ? AND status IN (?, ?) AND lease_owner = ? AND lease_expires_at > ?
-		  AND NOT EXISTS (SELECT 1 FROM review_units WHERE run_id = runs.id AND status NOT IN (?, ?))`,
-		domain.RunStatusChecking, timeText(now), runID, domain.RunStatusPlanned, domain.RunStatusReviewing,
-		owner, timeText(now), domain.UnitStatusCompleted, domain.UnitStatusSkippedBudget)
+		WHERE id = ? AND status IN (?, ?) AND lease_owner = ? AND lease_expires_at > ?`,
+		domain.RunStatusChecking, timeText(now), runID, domain.RunStatusPlanned, domain.RunStatusChecking,
+		owner, timeText(now))
 	if err != nil {
 		return fmt.Errorf("advance run to checking: %w", err)
 	}
@@ -661,19 +675,19 @@ func (s *Store) AdvanceRunToChecking(ctx context.Context, runID, owner string, n
 	return nil
 }
 
-// AdvanceCheckingToAggregating 只在全部 Checker 完成且 lease 仍属于当前进程时推进。
-func (s *Store) AdvanceCheckingToAggregating(ctx context.Context, runID, owner string, now time.Time) error {
+// AdvanceCheckingToReviewing 只在全部 Checker 完成且 lease 仍属于当前进程时推进。
+func (s *Store) AdvanceCheckingToReviewing(ctx context.Context, runID, owner string, now time.Time) error {
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET status = ?, updated_at = ?
 		WHERE id = ? AND status = ? AND lease_owner = ? AND lease_expires_at > ?
 		  AND NOT EXISTS (SELECT 1 FROM checker_runs WHERE run_id = runs.id AND status != ?)`,
-		domain.RunStatusAggregating, timeText(now), runID, domain.RunStatusChecking, owner, timeText(now), domain.CheckerStatusCompleted)
+		domain.RunStatusReviewing, timeText(now), runID, domain.RunStatusChecking, owner, timeText(now), domain.CheckerStatusCompleted)
 	if err != nil {
-		return fmt.Errorf("advance checking to aggregating: %w", err)
+		return fmt.Errorf("advance checking to reviewing: %w", err)
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("read aggregating result: %w", err)
+		return fmt.Errorf("read reviewing result: %w", err)
 	}
 	if changed != 1 {
 		return ErrRunNotReady
@@ -687,7 +701,7 @@ func (s *Store) AdvanceRunToAggregating(ctx context.Context, runID, owner string
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE runs SET status = ?, updated_at = ?
 		WHERE id = ?
-		  AND status IN (?, ?)
+		  AND status = ?
 		  AND lease_owner = ?
 		  AND lease_expires_at > ?
 		  AND NOT EXISTS (
@@ -695,7 +709,7 @@ func (s *Store) AdvanceRunToAggregating(ctx context.Context, runID, owner string
 			WHERE run_id = runs.id AND status NOT IN (?, ?)
 		  )`,
 		domain.RunStatusAggregating, timeText(now), runID,
-		domain.RunStatusPlanned, domain.RunStatusReviewing,
+		domain.RunStatusReviewing,
 		owner, timeText(now), domain.UnitStatusCompleted, domain.UnitStatusSkippedBudget,
 	)
 	if err != nil {

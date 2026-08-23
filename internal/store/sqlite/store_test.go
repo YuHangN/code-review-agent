@@ -196,7 +196,12 @@ func TestCheckerResultIsCheckpointedAtomically(t *testing.T) {
 		StartLine: 4, EndLine: 4, DiffHunk: "@@ -3,0 +4 @@\n+fmt.Printf(\"%d\", \"x\")\n",
 		Risk: "medium", Status: domain.UnitStatusCompleted, CreatedAt: now, UpdatedAt: now,
 	}
-	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
+	otherUnit := domain.ReviewUnit{
+		ID: "unit-other", RunID: run.ID, UnitKey: "other.go#8-8", FilePath: "other.go",
+		StartLine: 8, EndLine: 8, DiffHunk: "@@ -7,0 +8 @@\n+fmt.Printf(\"%d\", \"y\")\n",
+		Risk: "medium", Status: domain.UnitStatusCompleted, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit, otherUnit}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, time.Minute); err != nil {
@@ -218,10 +223,19 @@ func TestCheckerResultIsCheckpointedAtomically(t *testing.T) {
 		TraceID: trace.ID, Checker: "go_vet", File: "main.go", Line: 4, Column: 2,
 		Code: "printf", Message: "fmt.Printf format %d has arg of wrong type string", Severity: "high", CreatedAt: now.Add(2 * time.Second),
 	}
+	otherTrace := domain.ReviewTrace{
+		ID: "trace-checker-other", RunID: run.ID, UnitID: otherUnit.ID, CallID: "checker-call-other",
+		Detector: "checker:go_vet", Status: "completed", Response: `{"code":"printf"}`, CreatedAt: now.Add(2 * time.Second),
+	}
+	otherDiagnostic := domain.CheckerDiagnostic{
+		ID: "diagnostic-2", RunID: run.ID, CheckerRunID: claimed.ID, UnitID: otherUnit.ID,
+		TraceID: otherTrace.ID, Checker: "go_vet", File: "other.go", Line: 8, Column: 2,
+		Code: "printf", Message: "another printf mismatch", Severity: "high", CreatedAt: now.Add(2 * time.Second),
+	}
 	claimed.Command = []string{"go", "vet", "./..."}
 	claimed.ExitCode = 1
 	claimed.Output = "main.go:4:2: fmt.Printf format %d has arg of wrong type string"
-	if err := store.CompleteCheckerRun(ctx, claimed, []domain.CheckerDiagnostic{diagnostic}, []domain.ReviewTrace{trace}, "worker-a", now.Add(2*time.Second)); err != nil {
+	if err := store.CompleteCheckerRun(ctx, claimed, []domain.CheckerDiagnostic{diagnostic, otherDiagnostic}, []domain.ReviewTrace{trace, otherTrace}, "worker-a", now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -236,8 +250,15 @@ func TestCheckerResultIsCheckpointedAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(diagnostics) != 1 || diagnostics[0].TraceID != trace.ID || diagnostics[0].Message != diagnostic.Message {
+	if len(diagnostics) != 2 || diagnostics[0].TraceID != trace.ID || diagnostics[0].Message != diagnostic.Message {
 		t.Fatalf("checker diagnostics = %#v", diagnostics)
+	}
+	unitDiagnostics, err := store.ListCheckerDiagnosticsForUnit(ctx, run.ID, unit.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unitDiagnostics) != 1 || unitDiagnostics[0].UnitID != unit.ID {
+		t.Fatalf("unit checker diagnostics = %#v", unitDiagnostics)
 	}
 }
 
@@ -433,7 +454,7 @@ func TestReplaceFindingsIsAtomicAndIdempotent(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	now := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
-	run := domain.Run{ID: "run-verified", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	run := domain.Run{ID: "run-verified", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusReviewing, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
 	unit := domain.ReviewUnit{ID: "unit-verified", RunID: run.ID, UnitKey: "a", FilePath: "config.yaml", DiffHunk: "@@ -0,0 +1 @@\n+api_key: value\n", Risk: "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}
 	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
 		t.Fatal(err)
