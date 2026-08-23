@@ -39,9 +39,20 @@ func ExtractArchive(input io.Reader, destination string) error {
 		if files > maxArchiveFiles || total > maxArchiveBytes {
 			return fmt.Errorf("repository archive exceeds safety limit")
 		}
+		// PAX 全局头只携带归档元数据，不对应仓库中的文件。
+		if header.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
 		clean := path.Clean(header.Name)
 		parts := strings.Split(clean, "/")
-		if clean == "." || strings.HasPrefix(clean, "../") || path.IsAbs(clean) || len(parts) < 2 {
+		if clean == "." || strings.HasPrefix(clean, "../") || path.IsAbs(clean) {
+			return fmt.Errorf("unsafe repository archive path")
+		}
+		// GitHub tarball 的第一项是归档顶层目录；它只用于包裹仓库内容，无需落盘。
+		if len(parts) == 1 && header.Typeflag == tar.TypeDir {
+			continue
+		}
+		if len(parts) < 2 {
 			return fmt.Errorf("unsafe repository archive path")
 		}
 		relative := path.Join(parts[1:]...)

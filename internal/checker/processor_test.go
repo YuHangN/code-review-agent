@@ -15,7 +15,7 @@ import (
 
 func TestProcessorCheckpointsBothCheckersAndMapsAddedLines(t *testing.T) {
 	ctx := context.Background()
-	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -49,8 +49,12 @@ func TestProcessorCheckpointsBothCheckersAndMapsAddedLines(t *testing.T) {
 	if len(diagnostics) != 2 || runner.prepareCalls != 1 || runner.runCalls != 2 {
 		t.Fatalf("diagnostics=%#v prepare=%d run=%d", diagnostics, runner.prepareCalls, runner.runCalls)
 	}
-	if err := processor.Process(ctx, run.ID, "worker", now.Add(2*time.Second)); err != nil { t.Fatal(err) }
-	if runner.prepareCalls != 1 || runner.runCalls != 2 { t.Fatalf("completed checkers ran again: prepare=%d run=%d", runner.prepareCalls, runner.runCalls) }
+	if err := processor.Process(ctx, run.ID, "worker", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if runner.prepareCalls != 1 || runner.runCalls != 2 {
+		t.Fatalf("completed checkers ran again: prepare=%d run=%d", runner.prepareCalls, runner.runCalls)
+	}
 }
 
 type archiveSource struct{ data []byte }

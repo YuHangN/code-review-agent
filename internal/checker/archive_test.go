@@ -28,6 +28,39 @@ func TestExtractArchiveStripsGitHubRootAndRejectsLinks(t *testing.T) {
 	}
 }
 
+func TestExtractArchiveAllowsGitHubRootDirectoryEntry(t *testing.T) {
+	archive := tarGzip(t, []tarEntry{
+		{name: "repo-sha/", kind: tar.TypeDir},
+		{name: "repo-sha/go.mod", body: "module example.test/demo\n"},
+	})
+	destination := t.TempDir()
+
+	if err := checker.ExtractArchive(bytes.NewReader(archive), destination); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(destination, "go.mod"))
+	if err != nil || string(content) != "module example.test/demo\n" {
+		t.Fatalf("content = %q, err = %v", content, err)
+	}
+}
+
+func TestExtractArchiveAllowsPAXGlobalHeader(t *testing.T) {
+	archive := tarGzip(t, []tarEntry{
+		{name: "pax_global_header", kind: tar.TypeXGlobalHeader},
+		{name: "repo-sha/", kind: tar.TypeDir},
+		{name: "repo-sha/go.mod", body: "module example.test/demo\n"},
+	})
+	destination := t.TempDir()
+
+	if err := checker.ExtractArchive(bytes.NewReader(archive), destination); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(destination, "go.mod"))
+	if err != nil || string(content) != "module example.test/demo\n" {
+		t.Fatalf("content = %q, err = %v", content, err)
+	}
+}
+
 type tarEntry struct {
 	name, body, link string
 	kind             byte
@@ -43,7 +76,11 @@ func tarGzip(t *testing.T, entries []tarEntry) []byte {
 		if kind == 0 {
 			kind = tar.TypeReg
 		}
-		if err := tarWriter.WriteHeader(&tar.Header{Name: entry.name, Typeflag: kind, Linkname: entry.link, Mode: 0o644, Size: int64(len(entry.body))}); err != nil {
+		header := &tar.Header{Name: entry.name, Typeflag: kind, Linkname: entry.link, Mode: 0o644, Size: int64(len(entry.body))}
+		if kind == tar.TypeXGlobalHeader {
+			header = &tar.Header{Typeflag: kind, PAXRecords: map[string]string{"comment": "github archive"}}
+		}
+		if err := tarWriter.WriteHeader(header); err != nil {
 			t.Fatal(err)
 		}
 		if entry.body != "" {
