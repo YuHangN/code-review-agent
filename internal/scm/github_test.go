@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/YuHangN/code-review-agent/internal/scm"
@@ -18,6 +19,68 @@ func TestParseGitHubPullRequestURL(t *testing.T) {
 	}
 	if ref.Owner != "acme" || ref.Repository != "payments" || ref.Number != 42 {
 		t.Fatalf("parsed ref = %#v, want acme/payments#42", ref)
+	}
+}
+
+func TestGitHubAdapterReadsFileAtExplicitCommitSHA(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/repos/acme/payments/contents/internal/auth/token.go" {
+			t.Fatalf("request path = %q", request.URL.Path)
+		}
+		if request.URL.Query().Get("ref") != "head-sha" {
+			t.Fatalf("ref = %q, want head-sha", request.URL.Query().Get("ref"))
+		}
+		if request.Header.Get("Accept") != "application/vnd.github.raw+json" {
+			t.Fatalf("accept = %q", request.Header.Get("Accept"))
+		}
+		fmt.Fprint(writer, "package auth\n")
+	}))
+	defer server.Close()
+	adapter, err := scm.NewGitHubAdapter(server.Client(), server.URL, "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	content, err := adapter.ReadFile(context.Background(), scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha", "internal/auth/token.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "package auth\n" {
+		t.Fatalf("content = %q", content)
+	}
+}
+
+func TestGitHubAdapterRejectsUnsafeFilePathWithoutRequest(t *testing.T) {
+	requested := false
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requested = true }))
+	defer server.Close()
+	adapter, err := scm.NewGitHubAdapter(server.Client(), server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = adapter.ReadFile(context.Background(), scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha", "../.env")
+	if err == nil || !strings.Contains(err.Error(), "unsafe repository file path") {
+		t.Fatalf("ReadFile error = %v", err)
+	}
+	if requested {
+		t.Fatal("unsafe path reached GitHub API")
+	}
+}
+
+func TestGitHubAdapterRejectsOversizedRepositoryFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(writer, strings.Repeat("x", 2<<20))
+	}))
+	defer server.Close()
+	adapter, err := scm.NewGitHubAdapter(server.Client(), server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = adapter.ReadFile(context.Background(), scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha", "large.txt")
+	if err == nil || !strings.Contains(err.Error(), "response body exceeds limit") {
+		t.Fatalf("ReadFile error = %v", err)
 	}
 }
 

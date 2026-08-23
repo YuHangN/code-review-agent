@@ -23,6 +23,8 @@ var (
 	ErrRunNotAggregating = errors.New("run is not aggregating")
 	// ErrRunNotReportable 表示只有 aggregating/reported Run 可以保存报告。
 	ErrRunNotReportable = errors.New("run is not reportable")
+	// ErrAgentStepConflict 表示同一 Unit/round 已存在不同的 Agent 证据。
+	ErrAgentStepConflict = errors.New("agent step checkpoint conflicts with existing record")
 )
 
 var (
@@ -469,6 +471,125 @@ func insertReviewTrace(ctx context.Context, tx *sql.Tx, trace domain.ReviewTrace
 		return fmt.Errorf("insert review trace: %w", err)
 	}
 	return nil
+}
+
+// SaveAgentStep 以 unit_id + round 为幂等键保存一轮脱敏 Agent 证据。
+func (s *Store) SaveAgentStep(ctx context.Context, step domain.AgentStep, owner string, now time.Time) error {
+	if step.RunID == "" || step.UnitID == "" || step.Round <= 0 || step.ModelCallID == "" || step.Prompt == "" || step.Response == "" || step.CreatedAt.IsZero() || owner == "" || now.IsZero() {
+		return fmt.Errorf("invalid agent step")
+	}
+	toolCallsJSON, err := json.Marshal(step.ToolCalls)
+	if err != nil {
+		return fmt.Errorf("marshal agent tool calls: %w", err)
+	}
+	toolResultsJSON, err := json.Marshal(step.ToolResults)
+	if err != nil {
+		return fmt.Errorf("marshal agent tool results: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save agent step: %w", err)
+	}
+	defer tx.Rollback()
+	var currentOwner string
+	var leaseExpiresAt sql.NullString
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COALESCE(r.lease_owner, ''), r.lease_expires_at
+		FROM runs r
+		JOIN review_units u ON u.run_id = r.id
+		WHERE r.id = ? AND u.id = ?`, step.RunID, step.UnitID,
+	).Scan(&currentOwner, &leaseExpiresAt); err != nil {
+		return fmt.Errorf("read agent step lease: %w", err)
+	}
+	if currentOwner != owner || !leaseExpiresAt.Valid {
+		return ErrLeaseHeld
+	}
+	expiresAt, err := parseTime(leaseExpiresAt.String)
+	if err != nil {
+		return fmt.Errorf("parse agent step lease expiry: %w", err)
+	}
+	if !expiresAt.After(now) {
+		return ErrLeaseHeld
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO agent_steps (
+			unit_id, run_id, round, model_call_id, prompt, response,
+			tool_calls_json, tool_results_json, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		step.UnitID, step.RunID, step.Round, step.ModelCallID, step.Prompt, step.Response,
+		string(toolCallsJSON), string(toolResultsJSON), timeText(step.CreatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("insert agent step: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read agent step insert result: %w", err)
+	}
+	if inserted == 1 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit agent step: %w", err)
+		}
+		return nil
+	}
+	var existing domain.AgentStep
+	var existingCalls, existingResults string
+	err = tx.QueryRowContext(ctx, `
+		SELECT run_id, unit_id, round, model_call_id, prompt, response,
+		       tool_calls_json, tool_results_json
+		FROM agent_steps WHERE unit_id = ? AND round = ?`, step.UnitID, step.Round,
+	).Scan(
+		&existing.RunID, &existing.UnitID, &existing.Round, &existing.ModelCallID,
+		&existing.Prompt, &existing.Response, &existingCalls, &existingResults,
+	)
+	if err != nil {
+		return fmt.Errorf("read existing agent step: %w", err)
+	}
+	if existing.RunID == step.RunID && existing.UnitID == step.UnitID && existing.Round == step.Round && existing.ModelCallID == step.ModelCallID && existing.Prompt == step.Prompt && existing.Response == step.Response && existingCalls == string(toolCallsJSON) && existingResults == string(toolResultsJSON) {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit existing agent step: %w", err)
+		}
+		return nil
+	}
+	return ErrAgentStepConflict
+}
+
+// ListAgentSteps 按 round 返回 Unit 已完成的 Agent 轮次，用于恢复和 Trace。
+func (s *Store) ListAgentSteps(ctx context.Context, unitID string) ([]domain.AgentStep, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT run_id, unit_id, round, model_call_id, prompt, response,
+		       tool_calls_json, tool_results_json, created_at
+		FROM agent_steps WHERE unit_id = ? ORDER BY round`, unitID)
+	if err != nil {
+		return nil, fmt.Errorf("list agent steps: %w", err)
+	}
+	defer rows.Close()
+	var steps []domain.AgentStep
+	for rows.Next() {
+		var step domain.AgentStep
+		var toolCallsJSON, toolResultsJSON, createdAt string
+		if err := rows.Scan(
+			&step.RunID, &step.UnitID, &step.Round, &step.ModelCallID, &step.Prompt,
+			&step.Response, &toolCallsJSON, &toolResultsJSON, &createdAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan agent step: %w", err)
+		}
+		if err := json.Unmarshal([]byte(toolCallsJSON), &step.ToolCalls); err != nil {
+			return nil, fmt.Errorf("parse agent tool calls: %w", err)
+		}
+		if err := json.Unmarshal([]byte(toolResultsJSON), &step.ToolResults); err != nil {
+			return nil, fmt.Errorf("parse agent tool results: %w", err)
+		}
+		step.CreatedAt, err = parseTime(createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse agent step created_at: %w", err)
+		}
+		steps = append(steps, step)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate agent steps: %w", err)
+	}
+	return steps, nil
 }
 
 // ListCandidateFindings 返回一个 Run 尚待 Verifier 处理的候选问题。

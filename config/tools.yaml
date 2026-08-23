@@ -1,0 +1,14 @@
+agent:
+  max_rounds: 4
+  max_tool_calls: 6
+tools:
+  - name: read_file
+    description: 读取本次 PR 固定 head SHA 下的指定文本文件
+    implementation: repository_file
+    permissions: [snapshot_read]
+    max_result_bytes: 32768
+  - name: search_symbol
+    description: 在本次 PR 已固定并脱敏的 diff 中搜索符号
+    implementation: snapshot_search
+    permissions: [snapshot_read]
+    max_result_bytes: 16384

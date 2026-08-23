@@ -40,6 +40,15 @@ func NewSanitizer() Sanitizer {
 	return Sanitizer{}
 }
 
+// SanitizeFile 对工具读取的单个文件应用与 Snapshot 相同的敏感路径和 Secret 规则。
+func (Sanitizer) SanitizeFile(filePath, content string) (sanitized string, excluded bool, redactions []Redaction) {
+	if isSensitivePath(filePath) {
+		return "", true, nil
+	}
+	result := Result{}
+	return redactText(content, &result), false, result.Redactions
+}
+
 // SanitizeSnapshot 排除敏感文件并脱敏 diff 中的疑似凭据。
 func (Sanitizer) SanitizeSnapshot(input domain.ChangeSnapshot) Result {
 	result := Result{Snapshot: input}

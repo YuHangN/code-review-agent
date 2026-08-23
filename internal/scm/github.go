@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 
@@ -15,6 +16,11 @@ import (
 )
 
 const githubAPIVersion = "2026-03-10"
+
+const (
+	maxGitHubResponseBytes = int64(32 << 20)
+	maxRepositoryFileBytes = int64(1 << 20)
+)
 
 // GitHubAdapter 通过 GitHub REST API 拉取固定 SHA 的 PR 变更。
 type GitHubAdapter struct {
@@ -87,10 +93,53 @@ func (a *GitHubAdapter) Fetch(ctx context.Context, ref PullRequestRef) (domain.C
 	}, nil
 }
 
+// ReadFile 只读取调用方明确给出的 commit SHA，不跟随 PR 后续更新。
+func (a *GitHubAdapter) ReadFile(ctx context.Context, ref PullRequestRef, sha, filePath string) ([]byte, error) {
+	if ref.Owner == "" || ref.Repository == "" || strings.TrimSpace(sha) == "" || !safeRepositoryPath(filePath) {
+		return nil, fmt.Errorf("unsafe repository file path")
+	}
+	escapedPath := escapeRepositoryPath(filePath)
+	return a.getWithQueryLimit(
+		ctx,
+		fmt.Sprintf("/repos/%s/%s/contents/%s", url.PathEscape(ref.Owner), url.PathEscape(ref.Repository), escapedPath),
+		"application/vnd.github.raw+json",
+		url.Values{"ref": []string{sha}},
+		maxRepositoryFileBytes,
+	)
+}
+
+func safeRepositoryPath(filePath string) bool {
+	if filePath == "" || strings.HasPrefix(filePath, "/") || path.Clean(filePath) != filePath {
+		return false
+	}
+	for _, segment := range strings.Split(filePath, "/") {
+		if segment == "" || segment == "." || segment == ".." || segment == ".git" {
+			return false
+		}
+	}
+	return true
+}
+
+func escapeRepositoryPath(filePath string) string {
+	segments := strings.Split(filePath, "/")
+	for index, segment := range segments {
+		segments[index] = url.PathEscape(segment)
+	}
+	return strings.Join(segments, "/")
+}
+
 func (a *GitHubAdapter) get(ctx context.Context, path, accept string) ([]byte, error) {
+	return a.getWithQuery(ctx, path, accept, nil)
+}
+
+func (a *GitHubAdapter) getWithQuery(ctx context.Context, requestPath, accept string, query url.Values) ([]byte, error) {
+	return a.getWithQueryLimit(ctx, requestPath, accept, query, maxGitHubResponseBytes)
+}
+
+func (a *GitHubAdapter) getWithQueryLimit(ctx context.Context, requestPath, accept string, query url.Values, maxBytes int64) ([]byte, error) {
 	target := *a.apiBase
-	target.Path = strings.TrimRight(target.Path, "/") + path
-	target.RawQuery = ""
+	target.Path = strings.TrimRight(target.Path, "/") + requestPath
+	target.RawQuery = query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -106,9 +155,12 @@ func (a *GitHubAdapter) get(ctx context.Context, path, accept string) ([]byte, e
 		return nil, fmt.Errorf("send request: %w", err)
 	}
 	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
+	}
+	if int64(len(body)) > maxBytes {
+		return nil, fmt.Errorf("GitHub API response body exceeds limit")
 	}
 	if response.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub API returned HTTP %d", response.StatusCode)

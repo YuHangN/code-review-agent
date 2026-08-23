@@ -2,13 +2,112 @@ package review_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/llm"
 	"github.com/YuHangN/code-review-agent/internal/review"
+	"github.com/YuHangN/code-review-agent/internal/tools"
 )
+
+func TestAgentReviewerUsesToolObservationBeforeProducingFinding(t *testing.T) {
+	caller := &scriptedCaller{responses: []llm.Response{
+		{Content: `{"tool_calls":[{"id":"lookup-1","name":"search_symbol","arguments":{"symbol":"validateToken"}}]}`},
+		{Content: `{"findings":[{"category":"correctness","severity":"high","file":"handler.go","line":11,"title":"忽略校验错误","explanation":"调用方没有处理 token 校验失败","evidence":["工具结果显示 validateToken 返回 error"],"suggestion":"检查并返回校验错误"}]}`},
+	}}
+	registry, err := tools.NewRegistry([]tools.Registration{{
+		Name: "search_symbol", Description: "搜索固定 Snapshot", Implementation: "snapshot_search", Permissions: []string{"snapshot_read"}, MaxResultBytes: 4096,
+	}}, map[string]tools.Tool{"snapshot_search": reviewFixedTool{result: `{"matches":[{"file":"auth.go","line":8,"text":"func validateToken() error"}]}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer := review.NewAgentReviewer(caller, "economy", 5, registry, tools.AgentLimits{MaxRounds: 4, MaxToolCalls: 6})
+	unit := domain.ReviewUnit{ID: "unit-001", RunID: "run-001", FilePath: "handler.go", Risk: "high"}
+
+	result, err := reviewer.Review(context.Background(), review.Request{
+		CallID: "call-001", Owner: "worker-a", Unit: unit, Diff: "@@ -10 +10,2 @@\n func Handle() {\n+ validateToken()\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Findings) != 1 || result.Findings[0].Title != "忽略校验错误" {
+		t.Fatalf("findings = %#v", result.Findings)
+	}
+	if len(caller.requests) != 2 || !strings.Contains(caller.requests[1].Prompt, "func validateToken() error") {
+		t.Fatalf("second prompt did not contain tool observation: %#v", caller.requests)
+	}
+	if caller.requests[0].ID != "call-001-round-1" || caller.requests[1].ID != "call-001-round-2" {
+		t.Fatalf("call IDs = %q, %q", caller.requests[0].ID, caller.requests[1].ID)
+	}
+	if len(result.Steps) != 2 || len(result.Steps[0].ToolResults) != 1 || result.Steps[0].ToolResults[0].CallID != "lookup-1" {
+		t.Fatalf("agent steps = %#v", result.Steps)
+	}
+}
+
+func TestAgentReviewerStopsBeforeToolCallThatCannotReachFinalRound(t *testing.T) {
+	caller := &scriptedCaller{responses: []llm.Response{
+		{Content: `{"tool_calls":[{"id":"lookup-1","name":"search_symbol","arguments":{"symbol":"firstSymbol"}}]}`},
+		{Content: `{"tool_calls":[{"id":"lookup-2","name":"search_symbol","arguments":{"symbol":"secondSymbol"}}]}`},
+	}}
+	tool := &countingReviewTool{}
+	registry, err := tools.NewRegistry([]tools.Registration{{
+		Name: "search_symbol", Description: "搜索固定 Snapshot", Implementation: "snapshot_search", Permissions: []string{"snapshot_read"}, MaxResultBytes: 4096,
+	}}, map[string]tools.Tool{"snapshot_search": tool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewer := review.NewAgentReviewer(caller, "economy", 5, registry, tools.AgentLimits{MaxRounds: 2, MaxToolCalls: 6})
+	unit := domain.ReviewUnit{ID: "unit-001", RunID: "run-001", FilePath: "handler.go", Risk: "high"}
+
+	result, err := reviewer.Review(context.Background(), review.Request{
+		CallID: "call-001", Owner: "worker-a", Unit: unit, Diff: "@@ -0,0 +1 @@\n+firstSymbol()\n",
+	})
+	if !errors.Is(err, review.ErrAgentLimitExceeded) {
+		t.Fatalf("Review error = %v", err)
+	}
+	if tool.calls != 1 || len(result.Steps) != 2 {
+		t.Fatalf("tool calls = %d, steps = %#v", tool.calls, result.Steps)
+	}
+}
+
+func TestAgentReviewerResumesAfterCompletedToolRound(t *testing.T) {
+	checkpoint := &memoryAgentCheckpoint{}
+	firstCaller := &failAfterScriptedCaller{responses: []llm.Response{{Content: `{"tool_calls":[{"id":"lookup-1","name":"search_symbol","arguments":{"symbol":"validateToken"}}]}`}}, err: errors.New("temporary model failure")}
+	registry, err := tools.NewRegistry([]tools.Registration{{
+		Name: "search_symbol", Description: "搜索固定 Snapshot", Implementation: "snapshot_search", Permissions: []string{"snapshot_read"}, MaxResultBytes: 4096,
+	}}, map[string]tools.Tool{"snapshot_search": reviewFixedTool{result: `{"matches":[{"file":"auth.go","line":8,"text":"func validateToken() error"}]}`}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := domain.ReviewUnit{ID: "unit-001", RunID: "run-001", FilePath: "handler.go", Risk: "high"}
+	firstReviewer := review.NewRecoverableAgentReviewer(firstCaller, "economy", 5, registry, tools.AgentLimits{MaxRounds: 4, MaxToolCalls: 6}, checkpoint)
+
+	_, err = firstReviewer.Review(context.Background(), review.Request{
+		CallID: "call-unit-001-1", Owner: "worker-a", Unit: unit, Diff: "@@ -10 +10,2 @@\n func Handle() {\n+ validateToken()\n",
+	})
+	if err == nil || len(checkpoint.steps) != 1 {
+		t.Fatalf("first review error = %v, checkpoints = %#v", err, checkpoint.steps)
+	}
+
+	secondCaller := &scriptedCaller{responses: []llm.Response{{Content: `{"findings":[]}`}}}
+	secondReviewer := review.NewRecoverableAgentReviewer(secondCaller, "economy", 5, registry, tools.AgentLimits{MaxRounds: 4, MaxToolCalls: 6}, checkpoint)
+	result, err := secondReviewer.Review(context.Background(), review.Request{
+		CallID: "call-unit-001-2", Owner: "worker-b", Unit: unit, Diff: "@@ -10 +10,2 @@\n func Handle() {\n+ validateToken()\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondCaller.requests) != 1 || secondCaller.requests[0].ID != "call-unit-001-2-round-2" {
+		t.Fatalf("resume calls = %#v", secondCaller.requests)
+	}
+	if !strings.Contains(secondCaller.requests[0].Prompt, "func validateToken() error") || len(result.Steps) != 2 {
+		t.Fatalf("resume did not reuse tool observation: prompt=%q steps=%#v", secondCaller.requests[0].Prompt, result.Steps)
+	}
+}
 
 func TestReviewerBuildsPromptAndParsesCandidateFindings(t *testing.T) {
 	caller := &recordingCaller{response: llm.Response{Content: `{
@@ -154,6 +253,74 @@ type recordingCaller struct {
 	response llm.Response
 	err      error
 	requests []llm.CallRequest
+}
+
+type scriptedCaller struct {
+	responses []llm.Response
+	requests  []llm.CallRequest
+}
+
+type failAfterScriptedCaller struct {
+	responses []llm.Response
+	calls     int
+	err       error
+}
+
+func (caller *failAfterScriptedCaller) Call(_ context.Context, _ llm.CallRequest) (llm.Response, error) {
+	caller.calls++
+	if caller.calls > len(caller.responses) {
+		return llm.Response{}, caller.err
+	}
+	return caller.responses[caller.calls-1], nil
+}
+
+type memoryAgentCheckpoint struct {
+	steps []domain.AgentStep
+}
+
+func (checkpoint *memoryAgentCheckpoint) ListAgentSteps(_ context.Context, unitID string) ([]domain.AgentStep, error) {
+	var result []domain.AgentStep
+	for _, step := range checkpoint.steps {
+		if step.UnitID == unitID {
+			result = append(result, step)
+		}
+	}
+	return result, nil
+}
+
+func (checkpoint *memoryAgentCheckpoint) SaveAgentStep(_ context.Context, step domain.AgentStep, _ string, _ time.Time) error {
+	step.CreatedAt = time.Now().UTC()
+	checkpoint.steps = append(checkpoint.steps, step)
+	return nil
+}
+
+func (caller *scriptedCaller) Call(_ context.Context, request llm.CallRequest) (llm.Response, error) {
+	caller.requests = append(caller.requests, request)
+	if len(caller.requests) > len(caller.responses) {
+		return llm.Response{}, errors.New("unexpected model call")
+	}
+	return caller.responses[len(caller.requests)-1], nil
+}
+
+type reviewFixedTool struct {
+	result string
+}
+
+func (reviewFixedTool) RequiredPermission() string  { return "snapshot_read" }
+func (reviewFixedTool) Parameters() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (tool reviewFixedTool) Execute(context.Context, json.RawMessage) (string, error) {
+	return tool.result, nil
+}
+
+type countingReviewTool struct {
+	calls int
+}
+
+func (*countingReviewTool) RequiredPermission() string  { return "snapshot_read" }
+func (*countingReviewTool) Parameters() json.RawMessage { return json.RawMessage(`{"type":"object"}`) }
+func (tool *countingReviewTool) Execute(context.Context, json.RawMessage) (string, error) {
+	tool.calls++
+	return `{"matches":[]}`, nil
 }
 
 func (caller *recordingCaller) Call(_ context.Context, request llm.CallRequest) (llm.Response, error) {

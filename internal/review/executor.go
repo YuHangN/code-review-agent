@@ -54,7 +54,7 @@ func (executor Executor) Execute(ctx context.Context, unitID string, now time.Ti
 		return ExecutionOutcome{}, fmt.Errorf("start review unit: %w", err)
 	}
 	callID := fmt.Sprintf("call-%s-%d", unit.ID, unit.Attempt)
-	result, err := executor.reviewer.Review(ctx, Request{CallID: callID, Unit: unit, Diff: unit.DiffHunk})
+	result, err := executor.reviewer.Review(ctx, Request{CallID: callID, Owner: executor.owner, Unit: unit, Diff: unit.DiffHunk})
 	traceID := fmt.Sprintf("trace-%s-%d", unit.ID, unit.Attempt)
 	if err != nil {
 		status := domain.UnitStatusFailedRecoverable

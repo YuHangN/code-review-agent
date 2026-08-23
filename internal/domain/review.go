@@ -23,6 +23,34 @@ type ReviewTrace struct {
 	CreatedAt    time.Time
 }
 
+// AgentToolCall 是一轮中经过脱敏后持久化的模型工具请求。
+type AgentToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+// AgentToolResult 是返回模型的脱敏 Observation。
+type AgentToolResult struct {
+	CallID  string `json:"call_id"`
+	Name    string `json:"name"`
+	Content string `json:"content,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// AgentStep 是一个可独立恢复的模型轮次 checkpoint。
+type AgentStep struct {
+	RunID       string
+	UnitID      string
+	Round       int
+	ModelCallID string
+	Prompt      string
+	Response    string
+	ToolCalls   []AgentToolCall
+	ToolResults []AgentToolResult
+	CreatedAt   time.Time
+}
+
 // CandidateFindingRecord 是尚未经过 Verifier 的持久化候选问题。
 type CandidateFindingRecord struct {
 	ID          string

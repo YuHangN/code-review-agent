@@ -359,6 +359,102 @@ func TestSaveReportCheckpointsContentAndMarksRunReported(t *testing.T) {
 	}
 }
 
+func TestAgentStepCheckpointIsOrderedAndIdempotent(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)
+	run := domain.Run{ID: "run-agent", SourceURL: "https://example.test/pr/1", Provider: "github", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	unit := domain.ReviewUnit{ID: "unit-agent", RunID: run.ID, UnitKey: "main.go#1", FilePath: "main.go", Risk: "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	step := domain.AgentStep{
+		RunID: run.ID, UnitID: unit.ID, Round: 1, ModelCallID: "call-unit-agent-1-round-1",
+		Prompt: "prompt", Response: `{"tool_calls":[]}`,
+		ToolCalls:   []domain.AgentToolCall{{ID: "tool-1", Name: "read_file", Arguments: `{"path":"main.go"}`}},
+		ToolResults: []domain.AgentToolResult{{CallID: "tool-1", Name: "read_file", Content: `{"content":"package main"}`}},
+		CreatedAt:   now,
+	}
+	if err := store.SaveAgentStep(ctx, step, "worker-a", now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAgentStep(ctx, step, "worker-a", now.Add(2*time.Second)); err != nil {
+		t.Fatalf("idempotent save: %v", err)
+	}
+	steps, err := store.ListAgentSteps(ctx, unit.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].ModelCallID != step.ModelCallID || len(steps[0].ToolResults) != 1 || steps[0].ToolResults[0].Content != step.ToolResults[0].Content {
+		t.Fatalf("agent steps = %#v", steps)
+	}
+	conflict := step
+	conflict.Response = `{"findings":[]}`
+	if err := store.SaveAgentStep(ctx, conflict, "worker-a", now.Add(3*time.Second)); !errors.Is(err, sqlite.ErrAgentStepConflict) {
+		t.Fatalf("conflicting save error = %v", err)
+	}
+}
+
+func TestAgentStepCheckpointRejectsProcessWithoutRunLease(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)
+	run := domain.Run{ID: "run-agent-lease", SourceURL: "https://example.test/pr/1", Provider: "github", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	unit := domain.ReviewUnit{ID: "unit-agent-lease", RunID: run.ID, UnitKey: "main.go#1", Status: domain.UnitStatusRunning, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, run.ID, "worker-new", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	step := domain.AgentStep{RunID: run.ID, UnitID: unit.ID, Round: 1, ModelCallID: "call-1", Prompt: "prompt", Response: `{"findings":[]}`, CreatedAt: now}
+
+	if err := store.SaveAgentStep(ctx, step, "worker-old", now.Add(time.Second)); !errors.Is(err, sqlite.ErrLeaseHeld) {
+		t.Fatalf("old owner save error = %v", err)
+	}
+	steps, err := store.ListAgentSteps(ctx, unit.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 0 {
+		t.Fatalf("old owner persisted steps = %#v", steps)
+	}
+}
+
+func TestAgentStepCheckpointRejectsUnitFromDifferentRun(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)
+	runA := domain.Run{ID: "run-a", SourceURL: "https://example.test/pr/1", Provider: "github", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	runB := runA
+	runB.ID = "run-b"
+	unitB := domain.ReviewUnit{ID: "unit-b", RunID: runB.ID, UnitKey: "main.go#1", Status: domain.UnitStatusRunning, CreatedAt: now, UpdatedAt: now}
+	if err := store.CreateRun(ctx, runA, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateRun(ctx, runB, []domain.ReviewUnit{unitB}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, runA.ID, "worker-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	step := domain.AgentStep{RunID: runA.ID, UnitID: unitB.ID, Round: 1, ModelCallID: "call-1", Prompt: "prompt", Response: `{"findings":[]}`, CreatedAt: now}
+
+	if err := store.SaveAgentStep(ctx, step, "worker-a", now.Add(time.Second)); err == nil {
+		t.Fatal("cross-run agent step was accepted")
+	}
+	steps, err := store.ListAgentSteps(ctx, unitB.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 0 {
+		t.Fatalf("cross-run steps = %#v", steps)
+	}
+}
+
 func TestStoreClaimRunRejectsEmptyOwner(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})

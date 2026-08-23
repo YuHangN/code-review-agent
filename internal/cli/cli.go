@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/budget"
@@ -23,6 +24,7 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/scm"
 	"github.com/YuHangN/code-review-agent/internal/security"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
+	reviewtools "github.com/YuHangN/code-review-agent/internal/tools"
 	"github.com/YuHangN/code-review-agent/internal/verifier"
 	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
@@ -32,6 +34,7 @@ const (
 	defaultConfigPath = "config/runtime.yaml"
 	defaultGitHubAPI  = "https://api.github.com"
 	defaultOpenAIAPI  = "https://api.openai.com"
+	defaultToolsPath  = "config/tools.yaml"
 	microsPerCent     = int64(10_000)
 )
 
@@ -69,6 +72,7 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	configPath := flags.String("config", defaultConfigPath, "runtime config path")
 	budgetCents := flags.Int64("budget-cents", 0, "override total budget in cents")
 	outputPath := flags.String("output", "", "Markdown report output path")
+	toolsPath := flags.String("tools-config", configuredToolsPath(), "tools config path")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -110,6 +114,11 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	providers, err := providersForRuntime(runtimeConfig)
 	if err != nil {
 		fmt.Fprintf(stderr, "configure LLM providers: %v\n", err)
+		return 1
+	}
+	toolConfig, err := reviewtools.LoadConfig(*toolsPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "load tools config: %v\n", err)
 		return 1
 	}
 
@@ -173,7 +182,12 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
 		return 1
 	}
-	engine := newExecutionEngine(store, runtimeConfig, owner, providers, runtimeConfig.LLMTiers)
+	registry, err := newToolRegistry(toolConfig, adapter, ref, snapshot)
+	if err != nil {
+		fmt.Fprintf(stderr, "configure review tools: %v\n", err)
+		return 1
+	}
+	engine := newExecutionEngine(store, runtimeConfig, owner, providers, runtimeConfig.LLMTiers, registry, toolConfig.Agent)
 	result, err := engine.Execute(ctx, workflow.EngineRequest{
 		RunID: run.ID, Owner: owner, OutputPath: *outputPath,
 		Lease: workflow.LeaseSettings{TTL: runtimeConfig.LeaseTTL, RenewInterval: runtimeConfig.LeaseRenewInterval},
@@ -261,8 +275,27 @@ func executeTrace(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintf(stderr, "list verified findings: %v\n", err)
 		return 1
 	}
+	agentSteps, err := store.ListAgentSteps(ctx, trace.UnitID)
+	if err != nil {
+		fmt.Fprintf(stderr, "list trace agent steps: %v\n", err)
+		return 1
+	}
 	fmt.Fprintf(stdout, "trace_id=%s\nrun_id=%s\nunit_id=%s\ndetector=%s\nstatus=%s\n", trace.ID, trace.RunID, trace.UnitID, trace.Detector, trace.Status)
 	fmt.Fprintf(stdout, "diff:\n%s\nprompt:\n%s\nresponse:\n%s\n", unit.DiffHunk, trace.Prompt, trace.Response)
+	for _, step := range agentSteps {
+		fmt.Fprintf(stdout, "agent_round=%d\nmodel_call_id=%s\nagent_prompt:\n%s\nagent_response:\n%s\n", step.Round, step.ModelCallID, step.Prompt, step.Response)
+		for _, call := range step.ToolCalls {
+			fmt.Fprintf(stdout, "tool_call id=%s name=%s arguments=%s\n", call.ID, call.Name, call.Arguments)
+		}
+		for _, result := range step.ToolResults {
+			fmt.Fprintf(stdout, "tool_result call_id=%s name=%s\n", result.CallID, result.Name)
+			if result.Error != "" {
+				fmt.Fprintf(stdout, "tool_error=%s\n", result.Error)
+			} else {
+				fmt.Fprintf(stdout, "tool_content=%s\n", result.Content)
+			}
+		}
+	}
 	if trace.ErrorMessage != "" {
 		fmt.Fprintf(stdout, "error=%s\n", trace.ErrorMessage)
 	}
@@ -343,6 +376,7 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
 	configPath := flags.String("config", defaultConfigPath, "runtime config path")
 	outputPath := flags.String("output", "", "Markdown report output path")
+	toolsPath := flags.String("tools-config", configuredToolsPath(), "tools config path")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -367,19 +401,51 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return 1
 	}
 	providers := inactiveProviders(runtime.LLMTiers)
+	var registry *reviewtools.Registry
+	var agentLimits reviewtools.AgentLimits
 	if run.Status == domain.RunStatusPlanned || run.Status == domain.RunStatusReviewing {
 		providers, err = providersForRuntime(runtime)
 		if err != nil {
 			fmt.Fprintf(stderr, "configure LLM providers: %v\n", err)
 			return 1
 		}
+		toolConfig, configErr := reviewtools.LoadConfig(*toolsPath)
+		if configErr != nil {
+			fmt.Fprintf(stderr, "load tools config: %v\n", configErr)
+			return 1
+		}
+		snapshot, snapshotErr := store.GetSnapshot(ctx, runID)
+		if snapshotErr != nil {
+			fmt.Fprintf(stderr, "get run snapshot: %v\n", snapshotErr)
+			return 1
+		}
+		ref, refErr := pullRequestRef(run)
+		if refErr != nil {
+			fmt.Fprintf(stderr, "restore pull request reference: %v\n", refErr)
+			return 1
+		}
+		apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
+		if apiBaseURL == "" {
+			apiBaseURL = defaultGitHubAPI
+		}
+		adapter, adapterErr := scm.NewGitHubAdapter(nil, apiBaseURL, os.Getenv("GITHUB_TOKEN"))
+		if adapterErr != nil {
+			fmt.Fprintf(stderr, "create GitHub adapter: %v\n", adapterErr)
+			return 1
+		}
+		registry, err = newToolRegistry(toolConfig, adapter, ref, snapshot)
+		if err != nil {
+			fmt.Fprintf(stderr, "configure review tools: %v\n", err)
+			return 1
+		}
+		agentLimits = toolConfig.Agent
 	}
 	owner, err := newExecutorID()
 	if err != nil {
 		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
 		return 1
 	}
-	engine := newExecutionEngine(store, runtime, owner, providers, runtime.LLMTiers)
+	engine := newExecutionEngine(store, runtime, owner, providers, runtime.LLMTiers, registry, agentLimits)
 	result, err := engine.Execute(ctx, workflow.EngineRequest{
 		RunID: runID, Owner: owner, OutputPath: *outputPath,
 		Lease: workflow.LeaseSettings{TTL: runtime.LeaseTTL, RenewInterval: runtime.LeaseRenewInterval},
@@ -449,14 +515,40 @@ func openStore(ctx context.Context, dbPath, configPath string) (*sqlite.Store, c
 	return store, runtime, nil
 }
 
-func newExecutionEngine(store *sqlite.Store, runtime config.Runtime, owner string, providers map[string]llm.Provider, tiers map[string]llm.Tier) workflow.ExecutionEngine {
+func newExecutionEngine(store *sqlite.Store, runtime config.Runtime, owner string, providers map[string]llm.Provider, tiers map[string]llm.Tier, registry *reviewtools.Registry, agentLimits reviewtools.AgentLimits) workflow.ExecutionEngine {
 	gateway := llm.NewGateway(budget.NewManager(store), llm.ByteUpperBoundCounter{}, providers, tiers)
 	reviewer := review.NewReviewer(gateway, runtime.DefaultLLMTier, runtime.MaxFindingsPerUnit)
+	if registry != nil {
+		reviewer = review.NewRecoverableAgentReviewer(gateway, runtime.DefaultLLMTier, runtime.MaxFindingsPerUnit, registry, agentLimits, store)
+	}
 	executor := review.NewExecutor(store, reviewer, "llm_review", owner)
 	runner := workflow.NewRunner(workflow.NewService(store), executor)
 	aggregator := verifier.NewAggregator(store, verifier.NewDefault())
 	reporter := report.NewGenerator(store)
 	return workflow.NewExecutionEngine(store, runner, aggregator, reporter)
+}
+
+func newToolRegistry(config reviewtools.Config, adapter *scm.GitHubAdapter, ref scm.PullRequestRef, snapshot domain.ChangeSnapshot) (*reviewtools.Registry, error) {
+	implementations := map[string]reviewtools.Tool{
+		"repository_file": reviewtools.NewRepositoryFileTool(adapter, ref, snapshot.HeadSHA),
+		"snapshot_search": reviewtools.NewSnapshotSearchTool(snapshot.Diff, 20),
+	}
+	return reviewtools.NewRegistry(config.Tools, implementations)
+}
+
+func pullRequestRef(run domain.Run) (scm.PullRequestRef, error) {
+	parts := strings.Split(run.Repository, "/")
+	if run.Provider != "github" || len(parts) != 2 || parts[0] == "" || parts[1] == "" || run.ChangeNumber <= 0 {
+		return scm.PullRequestRef{}, fmt.Errorf("unsupported persisted SCM identity")
+	}
+	return scm.PullRequestRef{Owner: parts[0], Repository: parts[1], Number: run.ChangeNumber}, nil
+}
+
+func configuredToolsPath() string {
+	if value := os.Getenv("REVIEW_AGENT_TOOLS_CONFIG"); value != "" {
+		return value
+	}
+	return defaultToolsPath
 }
 
 // providersForRuntime 只从环境变量读取凭据，并按 tier 配置构建 Provider Registry。
