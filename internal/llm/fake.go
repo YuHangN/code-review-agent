@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// FakeProvider 为离线 Demo 和测试返回预设结果，不访问外部网络。
+// FakeProvider 为自动化测试返回预设结果，不访问外部网络。
 type FakeProvider struct {
 	Response Response
 	Err      error

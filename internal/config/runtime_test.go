@@ -18,6 +18,7 @@ review:
   currency: USD
   max_findings_per_unit: 5
 llm:
+  request_timeout: 90s
   default_tier: economy
   tiers:
     economy:
@@ -51,6 +52,9 @@ llm:
 	}
 	if runtime.DefaultLLMTier != "economy" {
 		t.Fatalf("default LLM tier = %q, want economy", runtime.DefaultLLMTier)
+	}
+	if runtime.LLMRequestTimeout != 90*time.Second {
+		t.Fatalf("LLM request timeout = %s, want 90s", runtime.LLMRequestTimeout)
 	}
 	tier := runtime.LLMTiers["economy"]
 	if tier.Provider != "fake" || tier.Model != "fake-reviewer" || tier.MaxOutputTokens != 1200 {

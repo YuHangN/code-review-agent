@@ -3,12 +3,12 @@ package cli
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -31,6 +31,7 @@ const (
 	defaultDBPath     = "review-agent.db"
 	defaultConfigPath = "config/runtime.yaml"
 	defaultGitHubAPI  = "https://api.github.com"
+	defaultOpenAIAPI  = "https://api.openai.com"
 	microsPerCent     = int64(10_000)
 )
 
@@ -45,8 +46,6 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "run":
 		return executeRun(ctx, args[1:], stdout, stderr)
-	case "demo":
-		return executeDemo(ctx, args[1:], stdout, stderr)
 	case "status":
 		return executeStatus(ctx, args[1:], stdout, stderr)
 	case "resume":
@@ -62,13 +61,14 @@ func Execute(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// executeRun 拉取并脱敏固定 Snapshot，再生成 Unit 并推进到 planned checkpoint。
+// executeRun 创建固定 Snapshot 和 Review Plan，再通过统一执行引擎生成报告。
 func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("run", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
 	configPath := flags.String("config", defaultConfigPath, "runtime config path")
 	budgetCents := flags.Int64("budget-cents", 0, "override total budget in cents")
+	outputPath := flags.String("output", "", "Markdown report output path")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -107,6 +107,11 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintln(stderr, "configured default budget is outside the supported range")
 		return 1
 	}
+	providers, err := providersForRuntime(runtimeConfig)
+	if err != nil {
+		fmt.Fprintf(stderr, "configure LLM providers: %v\n", err)
+		return 1
+	}
 
 	apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
 	if apiBaseURL == "" {
@@ -129,6 +134,9 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	if err != nil {
 		fmt.Fprintf(stderr, "create run ID: %v\n", err)
 		return 1
+	}
+	if *outputPath == "" {
+		*outputPath = filepath.Join("out", runID+".md")
 	}
 	now := time.Now().UTC()
 	snapshot.CreatedAt = now
@@ -158,110 +166,29 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "save review plan: %v\n", err)
 		return 1
 	}
+	// 在任何模型调用前输出 run_id；后续失败时用户仍能直接执行 resume。
 	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\nunits=%d\nredactions=%d\nexcluded_files=%d\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA, len(units), len(sanitized.Redactions), len(sanitized.ExcludedFiles))
+	owner, err := newExecutorID()
+	if err != nil {
+		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
+		return 1
+	}
+	engine := newExecutionEngine(store, runtimeConfig, owner, providers, runtimeConfig.LLMTiers)
+	result, err := engine.Execute(ctx, workflow.EngineRequest{
+		RunID: run.ID, Owner: owner, OutputPath: *outputPath,
+		Lease: workflow.LeaseSettings{TTL: runtimeConfig.LeaseTTL, RenewInterval: runtimeConfig.LeaseRenewInterval},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "execute review: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "status=%s\nreport_path=%s\n", result.Status, result.Report.Report.OutputPath)
 	return 0
 }
 
 // validBudgetCents 确保预算为正数，并且转换成微美元后不会溢出。
 func validBudgetCents(value int64) bool {
 	return value > 0 && value <= math.MaxInt64/microsPerCent
-}
-
-// executeDemo 使用 Fake Provider 跑通完整的离线 Review 链路，不访问网络。
-func executeDemo(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("demo", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
-	configPath := flags.String("config", defaultConfigPath, "runtime config path")
-	outputPath := flags.String("output", filepath.Join("out", "demo-report.md"), "Markdown report output path")
-	if err := flags.Parse(args); err != nil {
-		return 2
-	}
-	if len(flags.Args()) != 0 {
-		fmt.Fprintln(stderr, "demo does not accept positional arguments")
-		return 2
-	}
-
-	store, runtime, err := openStore(ctx, *dbPath, *configPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "open database: %v\n", err)
-		return 1
-	}
-	defer store.Close()
-
-	now := time.Now().UTC()
-	run := domain.Run{
-		ID:                "demo-run",
-		SourceURL:         "https://example.test/acme/demo/changes/42",
-		Provider:          "fake",
-		Repository:        "acme/demo",
-		ChangeNumber:      42,
-		Status:            domain.RunStatusFetched,
-		BudgetLimitMicros: 1_000_000,
-		CreatedAt:         now,
-		UpdatedAt:         now,
-	}
-	unit := domain.ReviewUnit{
-		ID: "unit-demo", RunID: run.ID, UnitKey: "internal/cache/cache.go#1-9",
-		FilePath: "internal/cache/cache.go", StartLine: 1, EndLine: 9,
-		DiffHunk: "@@ -0,0 +1,9 @@\n+package cache\n+\n+api_key := \"<REDACTED:API_KEY:1>\"\n+\n+var cache = map[string]string{}\n+\n+func Update(key, value string) {\n+\tgo func() { cache[key] = value }()\n+}\n",
-		Risk:     "high", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now,
-	}
-	diffHash := sha256.Sum256([]byte(unit.DiffHunk))
-	snapshot := domain.ChangeSnapshot{
-		BaseSHA: "demo-base-sha", HeadSHA: "demo-head-sha", Diff: unit.DiffHunk,
-		DiffSHA256: fmt.Sprintf("%x", diffHash[:]), CreatedAt: now,
-	}
-	service := workflow.NewService(store)
-	if err := service.StartFetched(ctx, workflow.FetchedRunRequest{Run: run, Snapshot: snapshot}); err != nil {
-		fmt.Fprintf(stderr, "create demo run: %v\n", err)
-		return 1
-	}
-	if err := service.SavePlan(ctx, run.ID, []domain.ReviewUnit{unit}, now); err != nil {
-		fmt.Fprintf(stderr, "save demo plan: %v\n", err)
-		return 1
-	}
-	provider := &llm.FakeProvider{Response: llm.Response{
-		Content: `{"findings":[{"category":"security","severity":"high","file":"internal/cache/cache.go","line":3,"title":"配置中包含硬编码 API Key","explanation":"凭据不应直接写入源码","evidence":["新增 api_key 赋值"],"suggestion":"改为从环境变量或密钥服务读取"},{"category":"concurrency","severity":"high","file":"internal/cache/cache.go","line":8,"title":"共享 map 存在并发访问风险","explanation":"新增 goroutine 在没有同步保护的情况下写入包级 map，可能与其他读写并发执行","evidence":["第 5 行声明包级 map，第 8 行从 goroutine 写入"],"suggestion":"使用 mutex 保护共享 map，或改用并发安全的数据结构"}]}`,
-		Usage:   &llm.TokenUsage{InputTokens: 120, OutputTokens: 180},
-	}}
-	gateway := llm.NewGateway(
-		budget.NewManager(store), llm.ByteUpperBoundCounter{},
-		map[string]llm.Provider{"fake": provider}, runtime.LLMTiers,
-	)
-	reviewer := review.NewReviewer(gateway, runtime.DefaultLLMTier, runtime.MaxFindingsPerUnit)
-	owner, err := newExecutorID()
-	if err != nil {
-		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
-		return 1
-	}
-	executor := review.NewExecutor(store, reviewer, "llm_review", owner)
-	runner := workflow.NewRunner(service, executor)
-	result, err := runner.Run(ctx, workflow.RunRequest{
-		RunID: run.ID, Owner: owner,
-		Lease: workflow.LeaseSettings{TTL: runtime.LeaseTTL, RenewInterval: runtime.LeaseRenewInterval},
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "run demo review: %v\n", err)
-		return 1
-	}
-	candidates, err := store.ListCandidateFindings(ctx, run.ID)
-	if err != nil || len(candidates) == 0 {
-		fmt.Fprintf(stderr, "read demo finding: %v\n", err)
-		return 1
-	}
-	aggregation, err := verifier.NewAggregator(store, verifier.NewDefault()).Aggregate(ctx, run.ID, time.Now().UTC())
-	if err != nil {
-		fmt.Fprintf(stderr, "aggregate demo findings: %v\n", err)
-		return 1
-	}
-	reportResult, err := report.NewGenerator(store).Generate(ctx, report.GenerateRequest{RunID: run.ID, OutputPath: *outputPath, Now: time.Now().UTC()})
-	if err != nil {
-		fmt.Fprintf(stderr, "generate demo report: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\ntrace_id=%s\nreport_path=%s\n", run.ID, domain.RunStatusReported, result.Completed, aggregation.Confirmed, aggregation.Advisory, candidates[0].TraceID, reportResult.Report.OutputPath)
-	return 0
 }
 
 // executeReport 为 aggregating Run 生成报告，或从 reported checkpoint 恢复报告文件。
@@ -409,38 +336,59 @@ func executeStatus(ctx context.Context, args []string, stdout, stderr io.Writer)
 	return 0
 }
 
-// executeResume 为当前 CLI 领取 Run，并输出仍需处理的 Unit。
+// executeResume 根据持久化状态继续执行，不重做已完成的阶段。
 func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	dbPath, configPath, rest, ok := parseOptions("resume", args, stderr)
-	if !ok {
+	flags := flag.NewFlagSet("resume", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	dbPath := flags.String("db", defaultDBPath, "SQLite database path")
+	configPath := flags.String("config", defaultConfigPath, "runtime config path")
+	outputPath := flags.String("output", "", "Markdown report output path")
+	if err := flags.Parse(args); err != nil {
 		return 2
 	}
-	if len(rest) != 1 {
+	if len(flags.Args()) != 1 {
 		fmt.Fprintln(stderr, "resume requires a run ID")
 		return 2
 	}
+	runID := flags.Args()[0]
+	if *outputPath == "" {
+		*outputPath = filepath.Join("out", runID+".md")
+	}
 
-	store, runtime, err := openStore(ctx, dbPath, configPath)
+	store, runtime, err := openStore(ctx, *dbPath, *configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
 		return 1
 	}
 	defer store.Close()
-
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		fmt.Fprintf(stderr, "get run: %v\n", err)
+		return 1
+	}
+	providers := inactiveProviders(runtime.LLMTiers)
+	if run.Status == domain.RunStatusPlanned || run.Status == domain.RunStatusReviewing {
+		providers, err = providersForRuntime(runtime)
+		if err != nil {
+			fmt.Fprintf(stderr, "configure LLM providers: %v\n", err)
+			return 1
+		}
+	}
 	owner, err := newExecutorID()
 	if err != nil {
 		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
 		return 1
 	}
-	result, err := workflow.NewService(store).Resume(ctx, rest[0], owner, time.Now().UTC(), runtime.LeaseTTL)
+	engine := newExecutionEngine(store, runtime, owner, providers, runtime.LLMTiers)
+	result, err := engine.Execute(ctx, workflow.EngineRequest{
+		RunID: runID, Owner: owner, OutputPath: *outputPath,
+		Lease: workflow.LeaseSettings{TTL: runtime.LeaseTTL, RenewInterval: runtime.LeaseRenewInterval},
+	})
 	if err != nil {
-		fmt.Fprintf(stderr, "resume run: %v\n", err)
+		fmt.Fprintf(stderr, "execute resumed run: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "run_id=%s\nresumable_units=%d\n", result.Run.ID, len(result.PendingUnits))
-	for _, unit := range result.PendingUnits {
-		fmt.Fprintln(stdout, unit.ID)
-	}
+	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\nreport_path=%s\nreused=%t\n", runID, result.Status, result.Review.Completed, result.Aggregation.Confirmed, result.Aggregation.Advisory, result.Report.Report.OutputPath, result.Report.Reused)
 	return 0
 }
 
@@ -501,6 +449,57 @@ func openStore(ctx context.Context, dbPath, configPath string) (*sqlite.Store, c
 	return store, runtime, nil
 }
 
+func newExecutionEngine(store *sqlite.Store, runtime config.Runtime, owner string, providers map[string]llm.Provider, tiers map[string]llm.Tier) workflow.ExecutionEngine {
+	gateway := llm.NewGateway(budget.NewManager(store), llm.ByteUpperBoundCounter{}, providers, tiers)
+	reviewer := review.NewReviewer(gateway, runtime.DefaultLLMTier, runtime.MaxFindingsPerUnit)
+	executor := review.NewExecutor(store, reviewer, "llm_review", owner)
+	runner := workflow.NewRunner(workflow.NewService(store), executor)
+	aggregator := verifier.NewAggregator(store, verifier.NewDefault())
+	reporter := report.NewGenerator(store)
+	return workflow.NewExecutionEngine(store, runner, aggregator, reporter)
+}
+
+// providersForRuntime 只从环境变量读取凭据，并按 tier 配置构建 Provider Registry。
+func providersForRuntime(runtime config.Runtime) (map[string]llm.Provider, error) {
+	providers := make(map[string]llm.Provider)
+	for _, tier := range runtime.LLMTiers {
+		if _, exists := providers[tier.Provider]; exists {
+			continue
+		}
+		switch tier.Provider {
+		case "fake":
+			providers["fake"] = &llm.FakeProvider{Response: llm.Response{
+				Content: `{"findings":[]}`,
+				Usage:   &llm.TokenUsage{},
+			}}
+		case "openai":
+			baseURL := os.Getenv("OPENAI_API_BASE_URL")
+			if baseURL == "" {
+				baseURL = defaultOpenAIAPI
+			}
+			provider, err := llm.NewOpenAIProvider(&http.Client{Timeout: runtime.LLMRequestTimeout}, baseURL, os.Getenv("OPENAI_API_KEY"))
+			if err != nil {
+				return nil, err
+			}
+			providers["openai"] = provider
+		default:
+			return nil, fmt.Errorf("unsupported LLM provider %q", tier.Provider)
+		}
+	}
+	return providers, nil
+}
+
+// inactiveProviders 只用于 aggregating/reported 阶段；这些阶段不会调用 Provider。
+func inactiveProviders(tiers map[string]llm.Tier) map[string]llm.Provider {
+	providers := make(map[string]llm.Provider)
+	for _, tier := range tiers {
+		if _, exists := providers[tier.Provider]; !exists {
+			providers[tier.Provider] = &llm.FakeProvider{}
+		}
+	}
+	return providers
+}
+
 func printUsage(writer io.Writer) {
-	fmt.Fprintln(writer, "usage: review-agent <run|demo|status|resume|trace|report> [--db path] [--config path] [id]")
+	fmt.Fprintln(writer, "usage: review-agent <run|status|resume|trace|report> [--db path] [--config path] [id]")
 }

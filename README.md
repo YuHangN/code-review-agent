@@ -11,19 +11,17 @@ review-agent run https://github.com/acme/payments/pull/42 \
   --budget-cents 1000 \
   --output out/report.md
 
-review-agent resume <run-id>
+review-agent resume <run-id> --output out/report.md
 review-agent status <run-id>
 review-agent trace <trace-id>
-review-agent demo
 ```
 
-- `run`：创建一次 Review，默认只生成 Markdown 报告。
+- `run`：固定 PR Snapshot，执行 Review 并生成 Markdown 报告。
 - `resume`：从 SQLite checkpoint 继续中断的 Run。
 - `status`：查看当前进度、预算和失败原因。
 - `trace`：查看某条 Finding 使用的 diff、工具和模型证据。
-- `demo`：离线运行固定 fixture，用于演示和测试。
 
-以上命令正在实现中；当前仓库只有项目骨架。
+真实 `run/resume` 从 `GITHUB_TOKEN` 和 `OPENAI_API_KEY` 环境变量读取凭据；凭据不会写入配置、SQLite、Trace 或报告。模型、价格和请求超时配置位于 `config/runtime.yaml`。
 
 ## 设计重点
 
@@ -42,8 +40,8 @@ PR URL
   → 创建可恢复的 Run
   → 获取并固定 base/head SHA Snapshot
   → 脱敏、切分并按风险排序 Review Unit
-  → 工具提供确定性证据，模型提出候选问题
-  → Verifier 分类为 confirmed / advisory，并写入 Trace
+  → 模型提出候选问题并写入脱敏 Trace
+  → Verifier 使用确定性规则分类为 confirmed / advisory
   → 保存 checkpoint 和预算账本
   → 生成 Markdown；显式 publish 后才回评 PR
 ```
@@ -55,7 +53,7 @@ PR URL
 
 ## 项目结构
 
-当前已搭好目录骨架，业务实现会按模块逐步补齐：
+当前核心链路对应的主要目录：
 
 ```text
 cmd/review-agent/          CLI 入口
@@ -63,13 +61,14 @@ internal/
   domain/                  核心领域模型
   workflow/                Review 状态机与恢复编排
   scm/                     GitHub、GitLab 和 Fake Adapter
-  snapshot/ security/      Snapshot 与脱敏边界
-  policy/ tools/ model/    策略、工具与模型网关
-  budget/ review/ trace/   预算、Finding 与可观测性
-  report/ store/sqlite/    Markdown 输出与本地持久化
-config/                    Policy 和规则配置
-prompts/                   版本化 Review / Verify Prompt
-fixtures/                  离线 Demo 和测试数据
-migrations/ scripts/       数据库迁移与演示脚本
-docker/ examples/          容器和示例产物
+  security/                Snapshot 与落盘内容的脱敏边界
+  llm/                     预算保护后的模型 Provider
+  budget/                  模型费用预留与结算
+  review/                  Prompt 执行与候选 Finding
+  verifier/                Finding 证据校验和置信度分级
+  report/                  Markdown 报告生成
+  store/sqlite/            SQLite checkpoint 与账本
+config/                    运行时、模型和价格配置
+prompts/                   编译进二进制的版本化 Review Prompt
+migrations/                SQLite schema migration
 ```

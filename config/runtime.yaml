@@ -7,11 +7,12 @@ review:
   currency: USD
   max_findings_per_unit: 5
 llm:
+  request_timeout: 90s
   default_tier: economy
   tiers:
     economy:
-      provider: fake
-      model: fake-reviewer
-      input_price_micros_per_million_tokens: 2000000
-      output_price_micros_per_million_tokens: 4000000
-      max_output_tokens: 1200
+      provider: openai
+      model: gpt-5.4-mini
+      input_price_micros_per_million_tokens: 750000
+      output_price_micros_per_million_tokens: 4500000
+      max_output_tokens: 4000

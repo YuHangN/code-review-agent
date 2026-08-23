@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,124 +18,59 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 )
 
-func TestExecuteDemoRunsOfflineReviewAndShowsTrace(t *testing.T) {
-	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "review.db")
-	reportPath := filepath.Join(t.TempDir(), "report.md")
-	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
-
+func TestExecuteRejectsRemovedDemoCommand(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath, "--output", reportPath}, &stdout, &stderr); code != 0 {
-		t.Fatalf("demo exit code = %d, stderr = %s", code, stderr.String())
-	}
-	for _, want := range []string{"run_id=demo-run", "status=reported", "completed=1", "confirmed=1", "advisory=1", "trace_id=trace-unit-demo-1", "report_path=" + reportPath} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("demo stdout = %q, want %q", stdout.String(), want)
-		}
-	}
-	reportContent, err := os.ReadFile(reportPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []string{"# Code Review Report", "## 高置信度，可直接采纳（1）", "## 仅供参考（1）", "trace-unit-demo-1"} {
-		if !strings.Contains(string(reportContent), want) {
-			t.Fatalf("report does not contain %q:\n%s", want, reportContent)
-		}
-	}
-	if stderr.Len() != 0 {
-		t.Fatalf("demo stderr = %q, want empty", stderr.String())
-	}
+	code := cli.Execute(context.Background(), []string{"demo"}, &stdout, &stderr)
 
-	stdout.Reset()
-	if code := cli.Execute(ctx, []string{"status", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("status exit code = %d, stderr = %s", code, stderr.String())
+	if code != 2 {
+		t.Fatalf("demo exit code = %d, want 2", code)
 	}
-	for _, want := range []string{"status=reported", "units=1", "pending=0", "running=0", "failed_recoverable=0", "completed=1", "skipped_budget=0", "budget_limit_micros=1000000", "budget_reserved_micros=0"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("status stdout = %q, want %q", stdout.String(), want)
-		}
-	}
-
-	stdout.Reset()
-	if code := cli.Execute(ctx, []string{"trace", "--db", dbPath, "--config", configPath, "trace-unit-demo-1"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("trace exit code = %d, stderr = %s", code, stderr.String())
-	}
-	for _, want := range []string{"trace_id=trace-unit-demo-1", "detector=llm_review", "共享 map 存在并发访问风险", "internal/cache/cache.go", "confidence=confirmed", "confidence=advisory", "diff:", "prompt:", "response:"} {
-		if !strings.Contains(stdout.String(), want) {
-			t.Fatalf("trace stdout = %q, want %q", stdout.String(), want)
-		}
-	}
-
-	restoredPath := filepath.Join(t.TempDir(), "restored.md")
-	stdout.Reset()
-	if code := cli.Execute(ctx, []string{"report", "--db", dbPath, "--config", configPath, "--output", restoredPath, "demo-run"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("report exit code = %d, stderr = %s", code, stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "reused=true") || !strings.Contains(stdout.String(), "report_path="+restoredPath) {
-		t.Fatalf("report stdout = %q", stdout.String())
-	}
-	restored, err := os.ReadFile(restoredPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(restored) != string(reportContent) {
-		t.Fatal("restored report differs from checkpoint")
+	if !strings.Contains(stderr.String(), "unknown command: demo") {
+		t.Fatalf("demo stderr = %q, want unknown command", stderr.String())
 	}
 }
 
-func TestExecuteResumeRejectsSecondCLIProcessWhileLeaseIsValid(t *testing.T) {
+func TestExecuteResumeCompletesPlannedRun(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "review.db")
-	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
-
-	var stdout, stderr bytes.Buffer
-	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath, "--output", filepath.Join(t.TempDir(), "report.md")}, &stdout, &stderr); code != 0 {
-		t.Fatalf("demo exit code = %d, stderr = %s", code, stderr.String())
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("first resume exit code = %d, stderr = %s", code, stderr.String())
-	}
-
-	stdout.Reset()
-	stderr.Reset()
-	if code := cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 1 {
-		t.Fatalf("second resume exit code = %d, want 1; stdout = %s; stderr = %s", code, stdout.String(), stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "run lease is held by another owner") {
-		t.Fatalf("second resume stderr = %q, want lease conflict", stderr.String())
-	}
-}
-
-func TestExecuteResumeUsesConfiguredLeaseTTL(t *testing.T) {
-	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "review.db")
-	configPath := writeRuntimeConfig(t, "2h", "30m", "50ms")
-
-	var stdout, stderr bytes.Buffer
-	if code := cli.Execute(ctx, []string{"demo", "--db", dbPath, "--config", configPath, "--output", filepath.Join(t.TempDir(), "report.md")}, &stdout, &stderr); code != 0 {
-		t.Fatalf("demo exit code = %d, stderr = %s", code, stderr.String())
-	}
-	stdout.Reset()
-	stderr.Reset()
-	startedAt := time.Now().UTC()
-	if code := cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "demo-run"}, &stdout, &stderr); code != 0 {
-		t.Fatalf("resume exit code = %d, stderr = %s", code, stderr.String())
-	}
-
+	configPath := writeRuntimeConfig(t, "60s", "20s", "50ms")
+	now := time.Date(2026, 8, 23, 0, 0, 0, 0, time.UTC)
 	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
-	run, err := store.GetRun(ctx, "demo-run")
+	run := domain.Run{ID: "run-resume", SourceURL: "https://example.test/pr/1", Provider: "fake", Repository: "acme/repo", ChangeNumber: 1, Status: domain.RunStatusPlanned, BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now}
+	unit := domain.ReviewUnit{ID: "unit-resume", RunID: run.ID, UnitKey: "main.go#1", FilePath: "main.go", StartLine: 1, EndLine: 1, DiffHunk: "@@ -0,0 +1 @@\n+safe\n", Risk: "low", Status: domain.UnitStatusPending, CreatedAt: now, UpdatedAt: now}
+	snapshot := domain.ChangeSnapshot{BaseSHA: "base", HeadSHA: "head", Diff: unit.DiffHunk, DiffSHA256: "hash", CreatedAt: now}
+	if err := store.CreateRunWithSnapshot(ctx, run, []domain.ReviewUnit{unit}, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(t.TempDir(), "report.md")
+	var stdout, stderr bytes.Buffer
+	if code := cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "--output", outputPath, run.ID}, &stdout, &stderr); code != 0 {
+		t.Fatalf("resume exit code = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "status=reported") || !strings.Contains(stdout.String(), "reused=false") {
+		t.Fatalf("resume stdout = %q", stdout.String())
+	}
+	store, err = sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remaining := run.LeaseExpiresAt.Sub(startedAt); remaining < time.Hour+59*time.Minute || remaining > 2*time.Hour+time.Minute {
-		t.Fatalf("lease duration = %s, want about 2h", remaining)
+	t.Cleanup(func() { _ = store.Close() })
+	gotRun, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	units, err := store.ListUnits(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRun.Status != domain.RunStatusReported || len(units) != 1 || units[0].Status != domain.UnitStatusCompleted {
+		t.Fatalf("resumed run = %#v, units = %#v", gotRun, units)
 	}
 }
 
@@ -160,10 +96,11 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "review.db")
+	outputPath := filepath.Join(t.TempDir(), "report.md")
 	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
 	var stdout, stderr bytes.Buffer
 	code := cli.Execute(ctx, []string{
-		"run", "--db", dbPath, "--config", configPath, "--budget-cents", "1000",
+		"run", "--db", dbPath, "--config", configPath, "--budget-cents", "1000", "--output", outputPath,
 		"https://github.com/acme/payments/pull/42",
 	}, &stdout, &stderr)
 	if code != 0 {
@@ -171,6 +108,9 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "base_sha=base-sha") || !strings.Contains(stdout.String(), "head_sha=head-sha") {
 		t.Fatalf("run stdout = %q, want pinned SHAs", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "status=reported") || !strings.Contains(stdout.String(), "report_path="+outputPath) {
+		t.Fatalf("run stdout = %q, want completed report", stdout.String())
 	}
 
 	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
@@ -200,7 +140,7 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storedRun.Status != domain.RunStatusPlanned || len(units) != 1 || units[0].Status != domain.UnitStatusPending {
+	if storedRun.Status != domain.RunStatusReported || len(units) != 1 || units[0].Status != domain.UnitStatusCompleted {
 		t.Fatalf("run status = %q, units = %#v", storedRun.Status, units)
 	}
 	if storedRun.BudgetLimitMicros != 10_000_000 {
@@ -225,9 +165,10 @@ func TestExecuteRunUsesConfiguredDefaultBudget(t *testing.T) {
 
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "review.db")
+	outputPath := filepath.Join(t.TempDir(), "report.md")
 	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
 	var stdout, stderr bytes.Buffer
-	if code := cli.Execute(ctx, []string{"run", "--db", dbPath, "--config", configPath, "https://github.com/acme/payments/pull/42"}, &stdout, &stderr); code != 0 {
+	if code := cli.Execute(ctx, []string{"run", "--db", dbPath, "--config", configPath, "--output", outputPath, "https://github.com/acme/payments/pull/42"}, &stdout, &stderr); code != 0 {
 		t.Fatalf("run exit code = %d, stderr = %s", code, stderr.String())
 	}
 	runID := strings.TrimPrefix(strings.Split(stdout.String(), "\n")[0], "run_id=")
@@ -245,6 +186,89 @@ func TestExecuteRunUsesConfiguredDefaultBudget(t *testing.T) {
 	}
 }
 
+func TestExecuteRunPrintsRunIDBeforeRecoverableProviderFailure(t *testing.T) {
+	var modelAvailable atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/acme/payments/pulls/42":
+			fmt.Fprint(writer, `{"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}`)
+		case "/repos/acme/payments/compare/base-sha...head-sha":
+			fmt.Fprint(writer, "diff --git a/main.go b/main.go\n@@ -0,0 +1 @@\n+changed\n")
+		case "/v1/responses":
+			writer.Header().Set("Content-Type", "application/json")
+			if !modelAvailable.Load() {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprint(writer, `{"error":{"message":"temporary model outage"}}`)
+				return
+			}
+			fmt.Fprint(writer, `{"id":"resp-2","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"findings\":[]}"}]}],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}`)
+		default:
+			t.Fatalf("unexpected request path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_API_BASE_URL", server.URL)
+	t.Setenv("OPENAI_API_BASE_URL", server.URL)
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "review.db")
+	configPath := writeOpenAIRuntimeConfig(t)
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute(ctx, []string{"run", "--db", dbPath, "--config", configPath, "--output", filepath.Join(t.TempDir(), "report.md"), "https://github.com/acme/payments/pull/42"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "temporary model outage") {
+		t.Fatalf("run stderr = %q", stderr.String())
+	}
+	firstLine := strings.Split(stdout.String(), "\n")[0]
+	if !strings.HasPrefix(firstLine, "run_id=run-") {
+		t.Fatalf("run stdout = %q, want resumable run ID", stdout.String())
+	}
+	runID := strings.TrimPrefix(firstLine, "run_id=")
+	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	units, err := store.ListUnits(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != domain.RunStatusReviewing || len(units) != 1 || units[0].Status != domain.UnitStatusFailedRecoverable {
+		t.Fatalf("failed run = %#v, units = %#v", run, units)
+	}
+	modelAvailable.Store(true)
+	stdout.Reset()
+	stderr.Reset()
+	outputPath := filepath.Join(t.TempDir(), "resumed.md")
+	if code := cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "--output", outputPath, runID}, &stdout, &stderr); code != 0 {
+		t.Fatalf("resume exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "status=reported") || !strings.Contains(stdout.String(), "reused=false") {
+		t.Fatalf("resume stdout = %q", stdout.String())
+	}
+	units, err = store.ListUnits(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(units) != 1 || units[0].Status != domain.UnitStatusCompleted || units[0].Attempt != 2 {
+		t.Fatalf("resumed units = %#v", units)
+	}
+	summary, err := store.BudgetSummary(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ReservedMicros != 0 || summary.ActualMicros != 17 {
+		t.Fatalf("resumed budget = %#v, want only successful call cost", summary)
+	}
+}
+
 func writeRuntimeConfig(t *testing.T, ttl, interval, busyTimeout string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "runtime.yaml")
@@ -257,6 +281,7 @@ func writeRuntimeConfig(t *testing.T, ttl, interval, busyTimeout string) string 
 		"  currency: USD\n" +
 		"  max_findings_per_unit: 5\n" +
 		"llm:\n" +
+		"  request_timeout: 90s\n" +
 		"  default_tier: economy\n" +
 		"  tiers:\n" +
 		"    economy:\n" +
@@ -265,6 +290,33 @@ func writeRuntimeConfig(t *testing.T, ttl, interval, busyTimeout string) string 
 		"      input_price_micros_per_million_tokens: 2000000\n" +
 		"      output_price_micros_per_million_tokens: 4000000\n" +
 		"      max_output_tokens: 1200\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeOpenAIRuntimeConfig(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "runtime.yaml")
+	content := "runtime:\n" +
+		"  lease_ttl: 60s\n" +
+		"  lease_renew_interval: 20s\n" +
+		"  sqlite_busy_timeout: 5s\n" +
+		"review:\n" +
+		"  default_budget_cents: 1000\n" +
+		"  currency: USD\n" +
+		"  max_findings_per_unit: 5\n" +
+		"llm:\n" +
+		"  request_timeout: 5s\n" +
+		"  default_tier: economy\n" +
+		"  tiers:\n" +
+		"    economy:\n" +
+		"      provider: openai\n" +
+		"      model: gpt-test\n" +
+		"      input_price_micros_per_million_tokens: 750000\n" +
+		"      output_price_micros_per_million_tokens: 4500000\n" +
+		"      max_output_tokens: 100\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
