@@ -1,6 +1,6 @@
 # Code Review Agent
 
-一个本地运行的 Go CLI：输入 GitHub PR，生成带证据和 Trace 的 Markdown Code Review 报告。
+一个本地运行的 Go CLI：输入 GitHub PR，生成带证据和 Trace 的 Markdown Code Review 报告。当前只注册 GitHub Adapter；GitLab MR 作为后续 TODO。
 
 这个项目重点解决的不是“让模型看一遍 diff”，而是 AI Review 在实际使用中的几个工程问题：中断恢复、费用上限、结果可追踪、置信度判断和敏感信息保护。
 
@@ -31,8 +31,8 @@ review-agent trace <trace-id>
 ```text
 用户执行 run
   → main 把命令参数交给 CLI
-  → CLI 识别 run，并解析 PR URL、预算和输出路径
-  → Application 读取配置、组装组件并驱动完整用例
+  → CLI 识别 run，并解析预算和输出路径
+  → Application 通过 SCM Registry 解析 URL、选择 Adapter，并驱动完整用例
   → 打开 SQLite 并检查数据库版本
   → 写入 created Run，立即向用户输出 run_id
   → Run 进入 fetching，GitHub Adapter 获取 base/head SHA 和 diff
@@ -54,7 +54,7 @@ review-agent trace <trace-id>
 - **证据分级**：只有确定性规则能够验证的问题才标记为高置信度；模型结合工具推理但未命中规则的问题仍标记为仅供参考。
 - **安全边界**：Secret Scanner 在模型调用和内容落盘前运行；首版不执行用户仓库中的构建或测试脚本。
 - **可扩展工具**：工具通过统一接口和 YAML 注册，新增工具不修改 Review Workflow。
-- **平台适配**：主流程只处理统一的变更快照；首版实现 GitHub，后续平台差异留在 Adapter 中。
+- **平台适配**：主流程只依赖统一的 `ChangeRef + Adapter`；首版注册 GitHub，后续可在 Registry 中增加 GitLab 实现。
 
 ## Reviewer Agent
 

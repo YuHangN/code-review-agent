@@ -3,6 +3,7 @@ package scm_test
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,11 +14,15 @@ import (
 )
 
 func TestParseGitHubPullRequestURL(t *testing.T) {
-	ref, err := scm.ParseGitHubPullRequestURL("https://github.com/acme/payments/pull/42")
+	adapter, err := scm.NewGitHubAdapter(nil, "https://api.github.com", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ref.Owner != "acme" || ref.Repository != "payments" || ref.Number != 42 {
+	ref, err := adapter.ParseURL("https://github.com/acme/payments/pull/42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ref.Provider != "github" || ref.Repository != "acme/payments" || ref.Number != 42 {
 		t.Fatalf("parsed ref = %#v, want acme/payments#42", ref)
 	}
 }
@@ -41,7 +46,7 @@ func TestGitHubAdapterReadsFileAtExplicitCommitSHA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	content, err := adapter.ReadFile(context.Background(), scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha", "internal/auth/token.go")
+	content, err := adapter.ReadFile(context.Background(), scm.ChangeRef{Provider: "github", Repository: "acme/payments", Number: 42}, "head-sha", "internal/auth/token.go")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +64,7 @@ func TestGitHubAdapterRejectsUnsafeFilePathWithoutRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = adapter.ReadFile(context.Background(), scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha", "../.env")
+	_, err = adapter.ReadFile(context.Background(), scm.ChangeRef{Provider: "github", Repository: "acme/payments", Number: 42}, "head-sha", "../.env")
 	if err == nil || !strings.Contains(err.Error(), "unsafe repository file path") {
 		t.Fatalf("ReadFile error = %v", err)
 	}
@@ -78,14 +83,18 @@ func TestGitHubAdapterRejectsOversizedRepositoryFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = adapter.ReadFile(context.Background(), scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha", "large.txt")
+	_, err = adapter.ReadFile(context.Background(), scm.ChangeRef{Provider: "github", Repository: "acme/payments", Number: 42}, "head-sha", "large.txt")
 	if err == nil || !strings.Contains(err.Error(), "response body exceeds limit") {
 		t.Fatalf("ReadFile error = %v", err)
 	}
 }
 
 func TestParseGitHubPullRequestURLRejectsUnsupportedURL(t *testing.T) {
-	if _, err := scm.ParseGitHubPullRequestURL("https://gitlab.com/acme/payments/-/merge_requests/42"); err == nil {
+	adapter, err := scm.NewGitHubAdapter(nil, "https://api.github.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.ParseURL("https://gitlab.com/acme/payments/-/merge_requests/42"); !errors.Is(err, scm.ErrUnsupportedURL) {
 		t.Fatal("ParseGitHubPullRequestURL succeeded, want error")
 	}
 }
@@ -118,7 +127,7 @@ func TestGitHubAdapterFetchesDiffForPinnedSHAs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := adapter.Fetch(context.Background(), scm.PullRequestRef{Owner: "acme", Repository: "payments", Number: 42})
+	snapshot, err := adapter.Fetch(context.Background(), scm.ChangeRef{Provider: "github", Repository: "acme/payments", Number: 42})
 	if err != nil {
 		t.Fatal(err)
 	}

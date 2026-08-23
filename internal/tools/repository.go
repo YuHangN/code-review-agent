@@ -24,17 +24,17 @@ var searchHunkPattern = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))?
 
 // RepositoryReader 是固定 SHA 文件读取工具所需的最小 SCM 能力。
 type RepositoryReader interface {
-	ReadFile(ctx context.Context, ref scm.PullRequestRef, sha, filePath string) ([]byte, error)
+	ReadFile(ctx context.Context, ref scm.ChangeRef, sha, filePath string) ([]byte, error)
 }
 
 // RepositoryFileTool 读取一个固定 head SHA 下的文本文件并在返回前脱敏。
 type RepositoryFileTool struct {
 	reader  RepositoryReader
-	ref     scm.PullRequestRef
+	ref     scm.ChangeRef
 	headSHA string
 }
 
-func NewRepositoryFileTool(reader RepositoryReader, ref scm.PullRequestRef, headSHA string) RepositoryFileTool {
+func NewRepositoryFileTool(reader RepositoryReader, ref scm.ChangeRef, headSHA string) RepositoryFileTool {
 	return RepositoryFileTool{reader: reader, ref: ref, headSHA: headSHA}
 }
 
@@ -48,7 +48,7 @@ func (tool RepositoryFileTool) Execute(ctx context.Context, raw json.RawMessage)
 	var arguments struct {
 		Path string `json:"path"`
 	}
-	if tool.reader == nil || tool.ref.Owner == "" || tool.ref.Repository == "" || tool.headSHA == "" || decodeArguments(raw, &arguments) != nil || strings.TrimSpace(arguments.Path) == "" {
+	if tool.reader == nil || tool.ref.Provider == "" || tool.ref.Repository == "" || tool.ref.Number <= 0 || tool.headSHA == "" || decodeArguments(raw, &arguments) != nil || strings.TrimSpace(arguments.Path) == "" {
 		return "", ErrInvalidArguments
 	}
 	if _, excluded, _ := security.NewSanitizer().SanitizeFile(arguments.Path, ""); excluded {

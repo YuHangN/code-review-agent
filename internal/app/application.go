@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/budget"
@@ -47,7 +46,6 @@ type Application struct {
 // StartRequest 描述一次全新的 PR 审查。
 type StartRequest struct {
 	URL          string
-	PullRequest  scm.PullRequestRef
 	BudgetCents  int64
 	OutputPath   string
 	OnRunCreated func(runID string)
@@ -82,8 +80,16 @@ func ValidBudgetCents(value int64) bool {
 
 // Start 创建 Run、固定 Snapshot、生成计划，并执行到 Markdown 报告。
 func (application Application) Start(ctx context.Context, request StartRequest) (StartResult, error) {
-	if application.store == nil || request.URL == "" || request.PullRequest.Owner == "" || !ValidBudgetCents(request.BudgetCents) {
+	if application.store == nil || request.URL == "" || !ValidBudgetCents(request.BudgetCents) {
 		return StartResult{}, ErrInvalidRequest
+	}
+	scmRegistry, err := application.scmRegistry()
+	if err != nil {
+		return StartResult{}, fmt.Errorf("configure SCM adapters: %w", err)
+	}
+	resolved, err := scmRegistry.ResolveURL(request.URL)
+	if err != nil {
+		return StartResult{}, fmt.Errorf("resolve change URL: %w", err)
 	}
 	providers, err := application.providers()
 	if err != nil {
@@ -93,11 +99,6 @@ func (application Application) Start(ctx context.Context, request StartRequest) 
 	if err != nil {
 		return StartResult{}, fmt.Errorf("load tools config: %w", err)
 	}
-	adapter, err := application.githubAdapter()
-	if err != nil {
-		return StartResult{}, fmt.Errorf("create GitHub adapter: %w", err)
-	}
-
 	runID, err := newID("run")
 	if err != nil {
 		return StartResult{}, fmt.Errorf("create run ID: %w", err)
@@ -110,9 +111,9 @@ func (application Application) Start(ctx context.Context, request StartRequest) 
 	run := domain.Run{
 		ID:                runID,
 		SourceURL:         request.URL,
-		Provider:          "github",
-		Repository:        request.PullRequest.Owner + "/" + request.PullRequest.Repository,
-		ChangeNumber:      request.PullRequest.Number,
+		Provider:          resolved.Ref.Provider,
+		Repository:        resolved.Ref.Repository,
+		ChangeNumber:      resolved.Ref.Number,
 		Status:            domain.RunStatusCreated,
 		BudgetLimitMicros: request.BudgetCents * microsPerCent,
 		CreatedAt:         now,
@@ -125,7 +126,7 @@ func (application Application) Start(ctx context.Context, request StartRequest) 
 		request.OnRunCreated(runID)
 	}
 
-	snapshot, sanitized, err := application.fetchSnapshot(ctx, run, request.PullRequest, adapter)
+	snapshot, sanitized, err := application.fetchSnapshot(ctx, run, resolved.Ref, resolved.Adapter)
 	if err != nil {
 		return result, err
 	}
@@ -145,7 +146,7 @@ func (application Application) Start(ctx context.Context, request StartRequest) 
 	if err != nil {
 		return result, fmt.Errorf("create worker ID: %w", err)
 	}
-	registry, err := newToolRegistry(toolConfig, adapter, request.PullRequest, snapshot)
+	registry, err := newToolRegistry(toolConfig, resolved.Adapter, resolved.Ref, snapshot)
 	if err != nil {
 		return result, fmt.Errorf("configure review tools: %w", err)
 	}
@@ -189,13 +190,17 @@ func (application Application) Resume(ctx context.Context, request ResumeRequest
 		if snapshotErr != nil {
 			return workflow.Result{}, fmt.Errorf("get run snapshot: %w", snapshotErr)
 		}
-		ref, refErr := pullRequestRef(run)
+		ref, refErr := changeRef(run)
 		if refErr != nil {
-			return workflow.Result{}, fmt.Errorf("restore pull request reference: %w", refErr)
+			return workflow.Result{}, fmt.Errorf("restore change reference: %w", refErr)
 		}
-		adapter, adapterErr := application.githubAdapter()
+		scmRegistry, adapterErr := application.scmRegistry()
 		if adapterErr != nil {
-			return workflow.Result{}, fmt.Errorf("create GitHub adapter: %w", adapterErr)
+			return workflow.Result{}, fmt.Errorf("configure SCM adapters: %w", adapterErr)
+		}
+		adapter, adapterErr := scmRegistry.Adapter(ref.Provider)
+		if adapterErr != nil {
+			return workflow.Result{}, fmt.Errorf("restore SCM adapter: %w", adapterErr)
 		}
 		registry, err = newToolRegistry(toolConfig, adapter, ref, snapshot)
 		if err != nil {
@@ -218,13 +223,17 @@ func (application Application) Resume(ctx context.Context, request ResumeRequest
 func (application Application) prepare(ctx context.Context, run domain.Run) (domain.Run, error) {
 	var snapshot domain.ChangeSnapshot
 	if run.Status == domain.RunStatusCreated || run.Status == domain.RunStatusFetching {
-		ref, err := pullRequestRef(run)
+		ref, err := changeRef(run)
 		if err != nil {
-			return domain.Run{}, fmt.Errorf("restore pull request reference: %w", err)
+			return domain.Run{}, fmt.Errorf("restore change reference: %w", err)
 		}
-		adapter, adapterErr := application.githubAdapter()
+		scmRegistry, adapterErr := application.scmRegistry()
 		if adapterErr != nil {
-			return domain.Run{}, fmt.Errorf("create GitHub adapter: %w", adapterErr)
+			return domain.Run{}, fmt.Errorf("configure SCM adapters: %w", adapterErr)
+		}
+		adapter, adapterErr := scmRegistry.Adapter(ref.Provider)
+		if adapterErr != nil {
+			return domain.Run{}, fmt.Errorf("restore SCM adapter: %w", adapterErr)
 		}
 		snapshot, _, err = application.fetchSnapshot(ctx, run, ref, adapter)
 		if err != nil {
@@ -250,13 +259,13 @@ func (application Application) prepare(ctx context.Context, run domain.Run) (dom
 	return run, nil
 }
 
-func (application Application) fetchSnapshot(ctx context.Context, run domain.Run, ref scm.PullRequestRef, adapter *scm.GitHubAdapter) (domain.ChangeSnapshot, security.Result, error) {
+func (application Application) fetchSnapshot(ctx context.Context, run domain.Run, ref scm.ChangeRef, adapter scm.Adapter) (domain.ChangeSnapshot, security.Result, error) {
 	if err := application.store.BeginFetch(ctx, run.ID, time.Now().UTC()); err != nil {
 		return domain.ChangeSnapshot{}, security.Result{}, fmt.Errorf("begin fetch: %w", err)
 	}
 	snapshot, err := adapter.Fetch(ctx, ref)
 	if err != nil {
-		return domain.ChangeSnapshot{}, security.Result{}, fmt.Errorf("fetch pull request: %w", err)
+		return domain.ChangeSnapshot{}, security.Result{}, fmt.Errorf("fetch change: %w", err)
 	}
 	sanitized := security.NewSanitizer().SanitizeSnapshot(snapshot)
 	snapshot = sanitized.Snapshot
@@ -281,12 +290,17 @@ func (application Application) execute(ctx context.Context, runID, owner, output
 	})
 }
 
-func (application Application) githubAdapter() (*scm.GitHubAdapter, error) {
+func (application Application) scmRegistry() (scm.Registry, error) {
 	baseURL := os.Getenv("GITHUB_API_BASE_URL")
 	if baseURL == "" {
 		baseURL = defaultGitHubAPI
 	}
-	return scm.NewGitHubAdapter(nil, baseURL, os.Getenv("GITHUB_TOKEN"))
+	github, err := scm.NewGitHubAdapter(nil, baseURL, os.Getenv("GITHUB_TOKEN"))
+	if err != nil {
+		return scm.Registry{}, err
+	}
+	// TODO: 在这里注册 GitLabAdapter，即可让 Application 和 Workflow 复用同一条执行链路。
+	return scm.NewRegistry(github)
 }
 
 func (application Application) providers() (map[string]llm.Provider, error) {
@@ -315,7 +329,7 @@ func (application Application) providers() (map[string]llm.Provider, error) {
 	return providers, nil
 }
 
-func newToolRegistry(config reviewtools.Config, adapter *scm.GitHubAdapter, ref scm.PullRequestRef, snapshot domain.ChangeSnapshot) (*reviewtools.Registry, error) {
+func newToolRegistry(config reviewtools.Config, adapter scm.Adapter, ref scm.ChangeRef, snapshot domain.ChangeSnapshot) (*reviewtools.Registry, error) {
 	implementations := map[string]reviewtools.Tool{
 		"repository_file": reviewtools.NewRepositoryFileTool(adapter, ref, snapshot.HeadSHA),
 		"snapshot_search": reviewtools.NewSnapshotSearchTool(snapshot.Diff, 20),
@@ -323,12 +337,11 @@ func newToolRegistry(config reviewtools.Config, adapter *scm.GitHubAdapter, ref 
 	return reviewtools.NewRegistry(config.Tools, implementations)
 }
 
-func pullRequestRef(run domain.Run) (scm.PullRequestRef, error) {
-	parts := strings.Split(run.Repository, "/")
-	if run.Provider != "github" || len(parts) != 2 || parts[0] == "" || parts[1] == "" || run.ChangeNumber <= 0 {
-		return scm.PullRequestRef{}, fmt.Errorf("unsupported persisted SCM identity")
+func changeRef(run domain.Run) (scm.ChangeRef, error) {
+	if run.Provider == "" || run.Repository == "" || run.ChangeNumber <= 0 {
+		return scm.ChangeRef{}, fmt.Errorf("invalid persisted SCM identity")
 	}
-	return scm.PullRequestRef{Owner: parts[0], Repository: parts[1], Number: run.ChangeNumber}, nil
+	return scm.ChangeRef{Provider: run.Provider, Repository: run.Repository, Number: run.ChangeNumber}, nil
 }
 
 func inactiveProviders(tiers map[string]llm.Tier) map[string]llm.Provider {

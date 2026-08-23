@@ -12,7 +12,7 @@ import (
 
 func TestRepositoryFileReadsPinnedSHAAndSanitizesContent(t *testing.T) {
 	reader := &recordingReader{content: []byte("package auth\nconst api_key = \"sk-1234567890abcdef\"\n")}
-	tool := tools.NewRepositoryFileTool(reader, scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha")
+	tool := tools.NewRepositoryFileTool(reader, scm.ChangeRef{Provider: "github", Repository: "acme/payments", Number: 42}, "head-sha")
 
 	content, err := tool.Execute(context.Background(), json.RawMessage(`{"path":"internal/auth/token.go"}`))
 	if err != nil {
@@ -34,7 +34,7 @@ func TestRepositoryFileReadsPinnedSHAAndSanitizesContent(t *testing.T) {
 
 func TestRepositoryFileRejectsSensitivePathBeforeReading(t *testing.T) {
 	reader := &recordingReader{content: []byte("SECRET=value")}
-	tool := tools.NewRepositoryFileTool(reader, scm.PullRequestRef{Owner: "acme", Repository: "payments"}, "head-sha")
+	tool := tools.NewRepositoryFileTool(reader, scm.ChangeRef{Provider: "github", Repository: "acme/payments", Number: 42}, "head-sha")
 
 	_, err := tool.Execute(context.Background(), json.RawMessage(`{"path":"config/.env"}`))
 	if err == nil || !strings.Contains(err.Error(), "sensitive repository file") {
@@ -64,7 +64,7 @@ type recordingReader struct {
 	path    string
 }
 
-func (reader *recordingReader) ReadFile(_ context.Context, _ scm.PullRequestRef, sha, filePath string) ([]byte, error) {
+func (reader *recordingReader) ReadFile(_ context.Context, _ scm.ChangeRef, sha, filePath string) ([]byte, error) {
 	reader.sha = sha
 	reader.path = filePath
 	return append([]byte(nil), reader.content...), nil

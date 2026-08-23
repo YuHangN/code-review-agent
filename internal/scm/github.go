@@ -41,26 +41,32 @@ func NewGitHubAdapter(client *http.Client, apiBaseURL, token string) (*GitHubAda
 	return &GitHubAdapter{client: client, apiBase: base, token: token}, nil
 }
 
-// ParseGitHubPullRequestURL 从标准 GitHub PR URL 中提取仓库和编号。
-func ParseGitHubPullRequestURL(rawURL string) (PullRequestRef, error) {
+func (*GitHubAdapter) Provider() string { return "github" }
+
+// ParseURL 从标准 GitHub PR URL 中提取平台无关的变更引用。
+func (*GitHubAdapter) ParseURL(rawURL string) (ChangeRef, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Scheme != "https" || !strings.EqualFold(parsed.Host, "github.com") {
-		return PullRequestRef{}, fmt.Errorf("unsupported GitHub pull request URL")
+		return ChangeRef{}, ErrUnsupportedURL
 	}
 	parts := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 	if len(parts) != 4 || parts[0] == "" || parts[1] == "" || parts[2] != "pull" {
-		return PullRequestRef{}, fmt.Errorf("invalid GitHub pull request URL")
+		return ChangeRef{}, fmt.Errorf("invalid GitHub pull request URL")
 	}
 	number, err := strconv.Atoi(parts[3])
 	if err != nil || number <= 0 {
-		return PullRequestRef{}, fmt.Errorf("invalid GitHub pull request number")
+		return ChangeRef{}, fmt.Errorf("invalid GitHub pull request number")
 	}
-	return PullRequestRef{Owner: parts[0], Repository: parts[1], Number: number}, nil
+	return ChangeRef{Provider: "github", Repository: parts[0] + "/" + parts[1], Number: number}, nil
 }
 
 // Fetch 先读取 PR 的 base/head SHA，再用这对 SHA 获取不可变的 compare diff。
-func (a *GitHubAdapter) Fetch(ctx context.Context, ref PullRequestRef) (domain.ChangeSnapshot, error) {
-	metadataBody, err := a.get(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(ref.Owner), url.PathEscape(ref.Repository), ref.Number), "application/vnd.github+json")
+func (a *GitHubAdapter) Fetch(ctx context.Context, ref ChangeRef) (domain.ChangeSnapshot, error) {
+	owner, repository, err := githubRepository(ref)
+	if err != nil {
+		return domain.ChangeSnapshot{}, err
+	}
+	metadataBody, err := a.get(ctx, fmt.Sprintf("/repos/%s/%s/pulls/%d", url.PathEscape(owner), url.PathEscape(repository), ref.Number), "application/vnd.github+json")
 	if err != nil {
 		return domain.ChangeSnapshot{}, fmt.Errorf("get pull request metadata: %w", err)
 	}
@@ -80,7 +86,7 @@ func (a *GitHubAdapter) Fetch(ctx context.Context, ref PullRequestRef) (domain.C
 	}
 
 	compare := url.PathEscape(metadata.Base.SHA + "..." + metadata.Head.SHA)
-	diff, err := a.get(ctx, fmt.Sprintf("/repos/%s/%s/compare/%s", url.PathEscape(ref.Owner), url.PathEscape(ref.Repository), compare), "application/vnd.github.diff")
+	diff, err := a.get(ctx, fmt.Sprintf("/repos/%s/%s/compare/%s", url.PathEscape(owner), url.PathEscape(repository), compare), "application/vnd.github.diff")
 	if err != nil {
 		return domain.ChangeSnapshot{}, fmt.Errorf("get pinned compare diff: %w", err)
 	}
@@ -94,18 +100,27 @@ func (a *GitHubAdapter) Fetch(ctx context.Context, ref PullRequestRef) (domain.C
 }
 
 // ReadFile 只读取调用方明确给出的 commit SHA，不跟随 PR 后续更新。
-func (a *GitHubAdapter) ReadFile(ctx context.Context, ref PullRequestRef, sha, filePath string) ([]byte, error) {
-	if ref.Owner == "" || ref.Repository == "" || strings.TrimSpace(sha) == "" || !safeRepositoryPath(filePath) {
+func (a *GitHubAdapter) ReadFile(ctx context.Context, ref ChangeRef, sha, filePath string) ([]byte, error) {
+	owner, repository, err := githubRepository(ref)
+	if err != nil || strings.TrimSpace(sha) == "" || !safeRepositoryPath(filePath) {
 		return nil, fmt.Errorf("unsafe repository file path")
 	}
 	escapedPath := escapeRepositoryPath(filePath)
 	return a.getWithQueryLimit(
 		ctx,
-		fmt.Sprintf("/repos/%s/%s/contents/%s", url.PathEscape(ref.Owner), url.PathEscape(ref.Repository), escapedPath),
+		fmt.Sprintf("/repos/%s/%s/contents/%s", url.PathEscape(owner), url.PathEscape(repository), escapedPath),
 		"application/vnd.github.raw+json",
 		url.Values{"ref": []string{sha}},
 		maxRepositoryFileBytes,
 	)
+}
+
+func githubRepository(ref ChangeRef) (string, string, error) {
+	parts := strings.Split(ref.Repository, "/")
+	if ref.Provider != "github" || len(parts) != 2 || parts[0] == "" || parts[1] == "" || ref.Number <= 0 {
+		return "", "", fmt.Errorf("invalid GitHub change reference")
+	}
+	return parts[0], parts[1], nil
 }
 
 func safeRepositoryPath(filePath string) bool {

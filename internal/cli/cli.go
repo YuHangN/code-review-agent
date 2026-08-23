@@ -14,7 +14,6 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/report"
-	"github.com/YuHangN/code-review-agent/internal/scm"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 )
 
@@ -69,7 +68,7 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		}
 	})
 	if len(flags.Args()) != 1 {
-		fmt.Fprintln(stderr, "run requires a GitHub pull request URL")
+		fmt.Fprintln(stderr, "run requires a pull request or merge request URL")
 		return 2
 	}
 	if budgetOverridden && !app.ValidBudgetCents(*budgetCents) {
@@ -77,11 +76,6 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		return 2
 	}
 
-	ref, err := scm.ParseGitHubPullRequestURL(flags.Args()[0])
-	if err != nil {
-		fmt.Fprintf(stderr, "parse pull request URL: %v\n", err)
-		return 2
-	}
 	store, runtimeConfig, err := openStore(ctx, *dbPath, *configPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "open database: %v\n", err)
@@ -100,7 +94,6 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	application := app.New(store, runtimeConfig, *toolsPath)
 	result, err := application.Start(ctx, app.StartRequest{
 		URL:         flags.Args()[0],
-		PullRequest: ref,
 		BudgetCents: effectiveBudgetCents,
 		OutputPath:  *outputPath,
 		OnRunCreated: func(runID string) {
