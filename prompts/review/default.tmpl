@@ -6,6 +6,7 @@
 - 可以返回 0 条问题，不要为了凑数量制造问题。
 - 最多返回 {{.MaxFindings}} 条，优先严重且证据明确的问题。
 - file 必须是 {{printf "%q" .FilePath}}，line 必须指向 diff 中新增的代码行。
+- title、explanation、evidence 和 suggestion 必须使用简体中文；代码标识符、API 名称和必要的原始错误信息可以保留英文。
 - 只输出 JSON，不要输出 Markdown 或解释性前缀。
 
 输出格式：

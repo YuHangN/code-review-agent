@@ -6,6 +6,7 @@
 - 已由 Checker 确认的问题不要重复报告，只寻找尚未覆盖的问题。
 - file 必须是 {{printf "%q" .FilePath}}，line 必须指向 diff 中新增的代码行。
 - 可以返回 0 条问题，最多返回 {{.MaxFindings}} 条。
+- title、explanation、evidence 和 suggestion 必须使用简体中文；代码标识符、API 名称和必要的原始错误信息可以保留英文。
 - 每轮只输出一个 JSON 对象，不要输出 Markdown、思考过程或解释性前缀。
 
 已授权工具：
