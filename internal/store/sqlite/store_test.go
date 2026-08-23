@@ -149,6 +149,39 @@ func TestStoreCreateRunPersistsUnitsAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestSaveFetchedSnapshotRejectsIncompleteSnapshotWithoutAdvancingRun(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	now := time.Date(2026, 8, 23, 4, 0, 0, 0, time.UTC)
+	run := domain.Run{
+		ID: "run-fetching", SourceURL: "https://github.com/acme/repo/pull/1",
+		Provider: "github", Repository: "acme/repo", ChangeNumber: 1,
+		Status: domain.RunStatusCreated, BudgetLimitMicros: 1_000_000,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginFetch(ctx, run.ID, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	err := store.SaveFetchedSnapshot(ctx, run.ID, domain.ChangeSnapshot{BaseSHA: "base-sha"}, now.Add(2*time.Second))
+	if err == nil {
+		t.Fatal("incomplete snapshot was accepted")
+	}
+	storedRun, getErr := store.GetRun(ctx, run.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if storedRun.Status != domain.RunStatusFetching {
+		t.Fatalf("run status = %q, want %q", storedRun.Status, domain.RunStatusFetching)
+	}
+	if _, getErr := store.GetSnapshot(ctx, run.ID); getErr == nil {
+		t.Fatal("incomplete snapshot was persisted")
+	}
+}
+
 func TestStoreClaimRunRejectsOtherOwnerUntilLeaseExpires(t *testing.T) {
 	ctx := context.Background()
 	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})

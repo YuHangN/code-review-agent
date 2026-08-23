@@ -23,6 +23,10 @@ var (
 	ErrRunNotAggregating = errors.New("run is not aggregating")
 	// ErrRunNotReportable 表示只有 aggregating/reported Run 可以保存报告。
 	ErrRunNotReportable = errors.New("run is not reportable")
+	// ErrRunNotFetchable 表示只有 created/fetching Run 可以进入或完成抓取阶段。
+	ErrRunNotFetchable = errors.New("run is not fetchable")
+	// ErrInvalidSnapshot 表示抓取结果缺少固定版本或完整性信息。
+	ErrInvalidSnapshot = errors.New("invalid change snapshot")
 	// ErrAgentStepConflict 表示同一 Unit/round 已存在不同的 Agent 证据。
 	ErrAgentStepConflict = errors.New("agent step checkpoint conflicts with existing record")
 )
@@ -180,6 +184,65 @@ func (s *Store) GetRun(ctx context.Context, id string) (domain.Run, error) {
 		       COALESCE(lease_owner, ''), lease_expires_at, created_at, updated_at
 		FROM runs WHERE id = ?`, id)
 	return scanRun(row)
+}
+
+// BeginFetch 将新建 Run 推进到 fetching；对已经处于 fetching 的 Run 可安全重复调用。
+func (s *Store) BeginFetch(ctx context.Context, runID string, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = ? AND status IN (?, ?)`,
+		domain.RunStatusFetching, timeText(now), runID,
+		domain.RunStatusCreated, domain.RunStatusFetching,
+	)
+	if err != nil {
+		return fmt.Errorf("begin fetching run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read begin fetching result: %w", err)
+	}
+	if changed != 1 {
+		return ErrRunNotFetchable
+	}
+	return nil
+}
+
+// SaveFetchedSnapshot 原子保存脱敏 Snapshot，并将 Run 从 fetching 推进到 fetched。
+func (s *Store) SaveFetchedSnapshot(ctx context.Context, runID string, snapshot domain.ChangeSnapshot, now time.Time) error {
+	if runID == "" || snapshot.BaseSHA == "" || snapshot.HeadSHA == "" || snapshot.DiffSHA256 == "" || snapshot.CreatedAt.IsZero() || now.IsZero() {
+		return ErrInvalidSnapshot
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin save fetched snapshot: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = ? AND status = ?`,
+		domain.RunStatusFetched, timeText(now), runID, domain.RunStatusFetching,
+	)
+	if err != nil {
+		return fmt.Errorf("complete fetching run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read complete fetching result: %w", err)
+	}
+	if changed != 1 {
+		return ErrRunNotFetchable
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO change_snapshots (run_id, base_sha, head_sha, diff, diff_sha256, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		runID, snapshot.BaseSHA, snapshot.HeadSHA, snapshot.Diff, snapshot.DiffSHA256, timeText(snapshot.CreatedAt),
+	); err != nil {
+		return fmt.Errorf("insert fetched snapshot: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit fetched snapshot: %w", err)
+	}
+	return nil
 }
 
 // ListUnits 按稳定的 unit key 顺序返回 Run 的 Unit，保证恢复结果可预测。

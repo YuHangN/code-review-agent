@@ -131,13 +131,6 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "create GitHub adapter: %v\n", err)
 		return 1
 	}
-	snapshot, err := adapter.Fetch(ctx, ref)
-	if err != nil {
-		fmt.Fprintf(stderr, "fetch pull request: %v\n", err)
-		return 1
-	}
-	sanitized := security.NewSanitizer().SanitizeSnapshot(snapshot)
-	snapshot = sanitized.Snapshot
 
 	runID, err := newRunID()
 	if err != nil {
@@ -148,21 +141,38 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		*outputPath = filepath.Join("out", runID+".md")
 	}
 	now := time.Now().UTC()
-	snapshot.CreatedAt = now
 	run := domain.Run{
 		ID:                runID,
 		SourceURL:         flags.Args()[0],
 		Provider:          "github",
 		Repository:        ref.Owner + "/" + ref.Repository,
 		ChangeNumber:      ref.Number,
-		Status:            domain.RunStatusFetched,
+		Status:            domain.RunStatusCreated,
 		BudgetLimitMicros: effectiveBudgetCents * microsPerCent,
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
 	service := workflow.NewService(store)
-	if err := service.StartFetched(ctx, workflow.FetchedRunRequest{Run: run, Snapshot: snapshot}); err != nil {
-		fmt.Fprintf(stderr, "create fetched run: %v\n", err)
+	if err := service.Start(ctx, workflow.StartRequest{Run: run}); err != nil {
+		fmt.Fprintf(stderr, "create run: %v\n", err)
+		return 1
+	}
+	// Run 一经持久化就立即输出 ID；即使首次 Fetch 失败也能通过 resume 继续。
+	fmt.Fprintf(stdout, "run_id=%s\n", run.ID)
+	if err := service.BeginFetch(ctx, run.ID, time.Now().UTC()); err != nil {
+		fmt.Fprintf(stderr, "begin fetch: %v\n", err)
+		return 1
+	}
+	snapshot, err := adapter.Fetch(ctx, ref)
+	if err != nil {
+		fmt.Fprintf(stderr, "fetch pull request: %v\n", err)
+		return 1
+	}
+	sanitized := security.NewSanitizer().SanitizeSnapshot(snapshot)
+	snapshot = sanitized.Snapshot
+	snapshot.CreatedAt = time.Now().UTC()
+	if err := service.CompleteFetch(ctx, run.ID, snapshot, snapshot.CreatedAt); err != nil {
+		fmt.Fprintf(stderr, "save fetched snapshot: %v\n", err)
 		return 1
 	}
 	units := planner.New().Plan(planner.Request{
@@ -175,8 +185,7 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "save review plan: %v\n", err)
 		return 1
 	}
-	// 在任何模型调用前输出 run_id；后续失败时用户仍能直接执行 resume。
-	fmt.Fprintf(stdout, "run_id=%s\nbase_sha=%s\nhead_sha=%s\nunits=%d\nredactions=%d\nexcluded_files=%d\n", run.ID, snapshot.BaseSHA, snapshot.HeadSHA, len(units), len(sanitized.Redactions), len(sanitized.ExcludedFiles))
+	fmt.Fprintf(stdout, "base_sha=%s\nhead_sha=%s\nunits=%d\nredactions=%d\nexcluded_files=%d\n", snapshot.BaseSHA, snapshot.HeadSHA, len(units), len(sanitized.Redactions), len(sanitized.ExcludedFiles))
 	owner, err := newExecutorID()
 	if err != nil {
 		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
@@ -400,6 +409,11 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 		fmt.Fprintf(stderr, "get run: %v\n", err)
 		return 1
 	}
+	run, err = prepareRunForExecution(ctx, store, run, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(stderr, "prepare resumed run: %v\n", err)
+		return 1
+	}
 	providers := inactiveProviders(runtime.LLMTiers)
 	var registry *reviewtools.Registry
 	var agentLimits reviewtools.AgentLimits
@@ -456,6 +470,58 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\nreport_path=%s\nreused=%t\n", runID, result.Status, result.Review.Completed, result.Aggregation.Confirmed, result.Aggregation.Advisory, result.Report.Report.OutputPath, result.Report.Reused)
 	return 0
+}
+
+// prepareRunForExecution 补齐 Engine 之前的可恢复阶段：首次抓取和 Review Unit 规划。
+// fetched 之后只读取持久化 Snapshot，不会跟随 PR 后续提交。
+func prepareRunForExecution(ctx context.Context, store *sqlite.Store, run domain.Run, now time.Time) (domain.Run, error) {
+	service := workflow.NewService(store)
+	var snapshot domain.ChangeSnapshot
+	if run.Status == domain.RunStatusCreated || run.Status == domain.RunStatusFetching {
+		ref, err := pullRequestRef(run)
+		if err != nil {
+			return domain.Run{}, fmt.Errorf("restore pull request reference: %w", err)
+		}
+		apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
+		if apiBaseURL == "" {
+			apiBaseURL = defaultGitHubAPI
+		}
+		adapter, err := scm.NewGitHubAdapter(nil, apiBaseURL, os.Getenv("GITHUB_TOKEN"))
+		if err != nil {
+			return domain.Run{}, fmt.Errorf("create GitHub adapter: %w", err)
+		}
+		if err := service.BeginFetch(ctx, run.ID, now); err != nil {
+			return domain.Run{}, err
+		}
+		snapshot, err = adapter.Fetch(ctx, ref)
+		if err != nil {
+			return domain.Run{}, fmt.Errorf("fetch pull request: %w", err)
+		}
+		snapshot = security.NewSanitizer().SanitizeSnapshot(snapshot).Snapshot
+		snapshot.CreatedAt = now
+		if err := service.CompleteFetch(ctx, run.ID, snapshot, snapshot.CreatedAt); err != nil {
+			return domain.Run{}, err
+		}
+		run.Status = domain.RunStatusFetched
+	}
+	if run.Status == domain.RunStatusFetched {
+		if snapshot.HeadSHA == "" {
+			var err error
+			snapshot, err = store.GetSnapshot(ctx, run.ID)
+			if err != nil {
+				return domain.Run{}, fmt.Errorf("get fetched snapshot: %w", err)
+			}
+		}
+		planTime := now
+		units := planner.New().Plan(planner.Request{
+			RunID: run.ID, HeadSHA: snapshot.HeadSHA, Diff: snapshot.Diff, Now: planTime,
+		})
+		if err := service.SavePlan(ctx, run.ID, units, planTime); err != nil {
+			return domain.Run{}, err
+		}
+		run.Status = domain.RunStatusPlanned
+	}
+	return run, nil
 }
 
 // newExecutorID 为一次 CLI 进程生成唯一的 lease owner。

@@ -251,6 +251,14 @@ func (s *heartbeatStore) CreateRunWithSnapshot(context.Context, domain.Run, []do
 	return nil
 }
 
+func (s *heartbeatStore) BeginFetch(context.Context, string, time.Time) error {
+	return nil
+}
+
+func (s *heartbeatStore) SaveFetchedSnapshot(context.Context, string, domain.ChangeSnapshot, time.Time) error {
+	return nil
+}
+
 func (s *heartbeatStore) SavePlan(context.Context, string, []domain.ReviewUnit, time.Time) error {
 	return nil
 }

@@ -157,6 +157,131 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	}
 }
 
+func TestExecuteResumeContinuesFetchingRunAfterNetworkFailure(t *testing.T) {
+	var diffAvailable atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/acme/payments/pulls/42":
+			fmt.Fprint(writer, `{"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}`)
+		case "/repos/acme/payments/compare/base-sha...head-sha":
+			if !diffAvailable.Load() {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			fmt.Fprint(writer, "diff --git a/main.go b/main.go\n@@ -0,0 +1 @@\n+safe\n")
+		default:
+			t.Fatalf("unexpected request path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_API_BASE_URL", server.URL)
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "review.db")
+	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
+	var stdout, stderr bytes.Buffer
+	code := cli.Execute(ctx, []string{"run", "--db", dbPath, "--config", configPath, "https://github.com/acme/payments/pull/42"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("run exit code = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	firstLine := strings.Split(stdout.String(), "\n")[0]
+	if !strings.HasPrefix(firstLine, "run_id=run-") {
+		t.Fatalf("run stdout = %q, want checkpointed run ID before fetch failure", stdout.String())
+	}
+	runID := strings.TrimPrefix(firstLine, "run_id=")
+	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != domain.RunStatusFetching {
+		t.Fatalf("run status = %q, want %q", run.Status, domain.RunStatusFetching)
+	}
+	if _, err := store.GetSnapshot(ctx, runID); err == nil {
+		t.Fatal("failed fetch unexpectedly persisted a snapshot")
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	diffAvailable.Store(true)
+	stdout.Reset()
+	stderr.Reset()
+	outputPath := filepath.Join(t.TempDir(), "resumed.md")
+	code = cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "--output", outputPath, runID}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("resume exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "status=reported") {
+		t.Fatalf("resume stdout = %q", stdout.String())
+	}
+	store, err = sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	run, err = store.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.GetSnapshot(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != domain.RunStatusReported || snapshot.HeadSHA != "head-sha" {
+		t.Fatalf("resumed run = %#v, snapshot = %#v", run, snapshot)
+	}
+}
+
+func TestExecuteResumeContinuesCreatedRun(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/repos/acme/payments/pulls/42":
+			fmt.Fprint(writer, `{"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}`)
+		case "/repos/acme/payments/compare/base-sha...head-sha":
+			fmt.Fprint(writer, "diff --git a/main.go b/main.go\n@@ -0,0 +1 @@\n+safe\n")
+		default:
+			t.Fatalf("unexpected request path: %s", request.URL.Path)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("GITHUB_API_BASE_URL", server.URL)
+
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "review.db")
+	configPath := writeRuntimeConfig(t, "60s", "20s", "5s")
+	now := time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)
+	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := domain.Run{
+		ID: "run-created", SourceURL: "https://github.com/acme/payments/pull/42",
+		Provider: "github", Repository: "acme/payments", ChangeNumber: 42,
+		Status: domain.RunStatusCreated, BudgetLimitMicros: 1_000_000,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateRun(ctx, run, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	outputPath := filepath.Join(t.TempDir(), "report.md")
+	code := cli.Execute(ctx, []string{"resume", "--db", dbPath, "--config", configPath, "--output", outputPath, run.ID}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("resume exit code = %d, stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "status=reported") {
+		t.Fatalf("resume stdout = %q", stdout.String())
+	}
+}
+
 func TestExecuteRunUsesConfiguredDefaultBudget(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {

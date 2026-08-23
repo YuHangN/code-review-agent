@@ -18,6 +18,8 @@ var (
 type Store interface {
 	CreateRun(ctx context.Context, run domain.Run, units []domain.ReviewUnit) error
 	CreateRunWithSnapshot(ctx context.Context, run domain.Run, units []domain.ReviewUnit, snapshot domain.ChangeSnapshot) error
+	BeginFetch(ctx context.Context, runID string, now time.Time) error
+	SaveFetchedSnapshot(ctx context.Context, runID string, snapshot domain.ChangeSnapshot, now time.Time) error
 	SavePlan(ctx context.Context, runID string, units []domain.ReviewUnit, now time.Time) error
 	ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error)
 	ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error)
@@ -52,6 +54,28 @@ type ResumeResult struct {
 // NewService 使用传入的持久化 Store 创建 Workflow Service。
 func NewService(store Store) Service {
 	return Service{store: store}
+}
+
+// BeginFetch 将 created Run 推进到 fetching；恢复 fetching Run 时可重复调用。
+func (s Service) BeginFetch(ctx context.Context, runID string, now time.Time) error {
+	if runID == "" {
+		return ErrRunIDRequired
+	}
+	if err := s.store.BeginFetch(ctx, runID, now); err != nil {
+		return fmt.Errorf("begin fetch: %w", err)
+	}
+	return nil
+}
+
+// CompleteFetch 原子保存不可变 Snapshot 和 fetched checkpoint。
+func (s Service) CompleteFetch(ctx context.Context, runID string, snapshot domain.ChangeSnapshot, now time.Time) error {
+	if runID == "" {
+		return ErrRunIDRequired
+	}
+	if err := s.store.SaveFetchedSnapshot(ctx, runID, snapshot, now); err != nil {
+		return fmt.Errorf("complete fetch: %w", err)
+	}
+	return nil
 }
 
 // Start 校验所有 Unit 都属于目标 Run，然后一起写入 checkpoint。
