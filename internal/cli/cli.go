@@ -2,40 +2,26 @@ package cli
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
-	"math"
-	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"github.com/YuHangN/code-review-agent/internal/app"
 	"github.com/YuHangN/code-review-agent/internal/budget"
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
-	"github.com/YuHangN/code-review-agent/internal/llm"
-	"github.com/YuHangN/code-review-agent/internal/planner"
 	"github.com/YuHangN/code-review-agent/internal/report"
-	"github.com/YuHangN/code-review-agent/internal/review"
 	"github.com/YuHangN/code-review-agent/internal/scm"
-	"github.com/YuHangN/code-review-agent/internal/security"
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
-	reviewtools "github.com/YuHangN/code-review-agent/internal/tools"
-	"github.com/YuHangN/code-review-agent/internal/verifier"
-	"github.com/YuHangN/code-review-agent/internal/workflow"
 )
 
 const (
 	defaultDBPath     = "review-agent.db"
 	defaultConfigPath = "config/runtime.yaml"
-	defaultGitHubAPI  = "https://api.github.com"
-	defaultOpenAIAPI  = "https://api.openai.com"
 	defaultToolsPath  = "config/tools.yaml"
-	microsPerCent     = int64(10_000)
 )
 
 // Execute 解析一个 CLI 子命令，并返回进程退出码。
@@ -86,7 +72,7 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintln(stderr, "run requires a GitHub pull request URL")
 		return 2
 	}
-	if budgetOverridden && !validBudgetCents(*budgetCents) {
+	if budgetOverridden && !app.ValidBudgetCents(*budgetCents) {
 		fmt.Fprintln(stderr, "budget-cents must be a positive integer within range")
 		return 2
 	}
@@ -107,111 +93,28 @@ func executeRun(ctx context.Context, args []string, stdout, stderr io.Writer) in
 	if budgetOverridden {
 		effectiveBudgetCents = *budgetCents
 	}
-	if !validBudgetCents(effectiveBudgetCents) {
+	if !app.ValidBudgetCents(effectiveBudgetCents) {
 		fmt.Fprintln(stderr, "configured default budget is outside the supported range")
 		return 1
 	}
-	providers, err := providersForRuntime(runtimeConfig)
-	if err != nil {
-		fmt.Fprintf(stderr, "configure LLM providers: %v\n", err)
-		return 1
-	}
-	toolConfig, err := reviewtools.LoadConfig(*toolsPath)
-	if err != nil {
-		fmt.Fprintf(stderr, "load tools config: %v\n", err)
-		return 1
-	}
-
-	apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
-	if apiBaseURL == "" {
-		apiBaseURL = defaultGitHubAPI
-	}
-	adapter, err := scm.NewGitHubAdapter(nil, apiBaseURL, os.Getenv("GITHUB_TOKEN"))
-	if err != nil {
-		fmt.Fprintf(stderr, "create GitHub adapter: %v\n", err)
-		return 1
-	}
-
-	runID, err := newRunID()
-	if err != nil {
-		fmt.Fprintf(stderr, "create run ID: %v\n", err)
-		return 1
-	}
-	if *outputPath == "" {
-		*outputPath = filepath.Join("out", runID+".md")
-	}
-	now := time.Now().UTC()
-	run := domain.Run{
-		ID:                runID,
-		SourceURL:         flags.Args()[0],
-		Provider:          "github",
-		Repository:        ref.Owner + "/" + ref.Repository,
-		ChangeNumber:      ref.Number,
-		Status:            domain.RunStatusCreated,
-		BudgetLimitMicros: effectiveBudgetCents * microsPerCent,
-		CreatedAt:         now,
-		UpdatedAt:         now,
-	}
-	service := workflow.NewService(store)
-	if err := service.Start(ctx, workflow.StartRequest{Run: run}); err != nil {
-		fmt.Fprintf(stderr, "create run: %v\n", err)
-		return 1
-	}
-	// Run 一经持久化就立即输出 ID；即使首次 Fetch 失败也能通过 resume 继续。
-	fmt.Fprintf(stdout, "run_id=%s\n", run.ID)
-	if err := service.BeginFetch(ctx, run.ID, time.Now().UTC()); err != nil {
-		fmt.Fprintf(stderr, "begin fetch: %v\n", err)
-		return 1
-	}
-	snapshot, err := adapter.Fetch(ctx, ref)
-	if err != nil {
-		fmt.Fprintf(stderr, "fetch pull request: %v\n", err)
-		return 1
-	}
-	sanitized := security.NewSanitizer().SanitizeSnapshot(snapshot)
-	snapshot = sanitized.Snapshot
-	snapshot.CreatedAt = time.Now().UTC()
-	if err := service.CompleteFetch(ctx, run.ID, snapshot, snapshot.CreatedAt); err != nil {
-		fmt.Fprintf(stderr, "save fetched snapshot: %v\n", err)
-		return 1
-	}
-	units := planner.New().Plan(planner.Request{
-		RunID:   run.ID,
-		HeadSHA: snapshot.HeadSHA,
-		Diff:    snapshot.Diff,
-		Now:     now,
-	})
-	if err := service.SavePlan(ctx, run.ID, units, now); err != nil {
-		fmt.Fprintf(stderr, "save review plan: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "base_sha=%s\nhead_sha=%s\nunits=%d\nredactions=%d\nexcluded_files=%d\n", snapshot.BaseSHA, snapshot.HeadSHA, len(units), len(sanitized.Redactions), len(sanitized.ExcludedFiles))
-	owner, err := newExecutorID()
-	if err != nil {
-		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
-		return 1
-	}
-	registry, err := newToolRegistry(toolConfig, adapter, ref, snapshot)
-	if err != nil {
-		fmt.Fprintf(stderr, "configure review tools: %v\n", err)
-		return 1
-	}
-	engine := newExecutionEngine(store, runtimeConfig, owner, providers, runtimeConfig.LLMTiers, registry, toolConfig.Agent)
-	result, err := engine.Execute(ctx, workflow.EngineRequest{
-		RunID: run.ID, Owner: owner, OutputPath: *outputPath,
-		Lease: workflow.LeaseSettings{TTL: runtimeConfig.LeaseTTL, RenewInterval: runtimeConfig.LeaseRenewInterval},
+	application := app.New(store, runtimeConfig, *toolsPath)
+	result, err := application.Start(ctx, app.StartRequest{
+		URL:         flags.Args()[0],
+		PullRequest: ref,
+		BudgetCents: effectiveBudgetCents,
+		OutputPath:  *outputPath,
+		OnRunCreated: func(runID string) {
+			// Run 持久化后立即输出 ID；后续断网仍可用 resume 继续。
+			fmt.Fprintf(stdout, "run_id=%s\n", runID)
+		},
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "execute review: %v\n", err)
+		fmt.Fprintf(stderr, "run review: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "status=%s\nreport_path=%s\n", result.Status, result.Report.Report.OutputPath)
+	fmt.Fprintf(stdout, "base_sha=%s\nhead_sha=%s\nunits=%d\nredactions=%d\nexcluded_files=%d\n", result.BaseSHA, result.HeadSHA, result.Units, result.Redactions, result.ExcludedFiles)
+	fmt.Fprintf(stdout, "status=%s\nreport_path=%s\n", result.Execution.Status, result.Execution.Report.Report.OutputPath)
 	return 0
-}
-
-// validBudgetCents 确保预算为正数，并且转换成微美元后不会溢出。
-func validBudgetCents(value int64) bool {
-	return value > 0 && value <= math.MaxInt64/microsPerCent
 }
 
 // executeReport 为 aggregating Run 生成报告，或从 reported checkpoint 恢复报告文件。
@@ -404,156 +307,13 @@ func executeResume(ctx context.Context, args []string, stdout, stderr io.Writer)
 		return 1
 	}
 	defer store.Close()
-	run, err := store.GetRun(ctx, runID)
+	result, err := app.New(store, runtime, *toolsPath).Resume(ctx, app.ResumeRequest{RunID: runID, OutputPath: *outputPath})
 	if err != nil {
-		fmt.Fprintf(stderr, "get run: %v\n", err)
+		fmt.Fprintf(stderr, "resume review: %v\n", err)
 		return 1
 	}
-	run, err = prepareRunForExecution(ctx, store, run, time.Now().UTC())
-	if err != nil {
-		fmt.Fprintf(stderr, "prepare resumed run: %v\n", err)
-		return 1
-	}
-	providers := inactiveProviders(runtime.LLMTiers)
-	var registry *reviewtools.Registry
-	var agentLimits reviewtools.AgentLimits
-	if run.Status == domain.RunStatusPlanned || run.Status == domain.RunStatusReviewing {
-		providers, err = providersForRuntime(runtime)
-		if err != nil {
-			fmt.Fprintf(stderr, "configure LLM providers: %v\n", err)
-			return 1
-		}
-		toolConfig, configErr := reviewtools.LoadConfig(*toolsPath)
-		if configErr != nil {
-			fmt.Fprintf(stderr, "load tools config: %v\n", configErr)
-			return 1
-		}
-		snapshot, snapshotErr := store.GetSnapshot(ctx, runID)
-		if snapshotErr != nil {
-			fmt.Fprintf(stderr, "get run snapshot: %v\n", snapshotErr)
-			return 1
-		}
-		ref, refErr := pullRequestRef(run)
-		if refErr != nil {
-			fmt.Fprintf(stderr, "restore pull request reference: %v\n", refErr)
-			return 1
-		}
-		apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
-		if apiBaseURL == "" {
-			apiBaseURL = defaultGitHubAPI
-		}
-		adapter, adapterErr := scm.NewGitHubAdapter(nil, apiBaseURL, os.Getenv("GITHUB_TOKEN"))
-		if adapterErr != nil {
-			fmt.Fprintf(stderr, "create GitHub adapter: %v\n", adapterErr)
-			return 1
-		}
-		registry, err = newToolRegistry(toolConfig, adapter, ref, snapshot)
-		if err != nil {
-			fmt.Fprintf(stderr, "configure review tools: %v\n", err)
-			return 1
-		}
-		agentLimits = toolConfig.Agent
-	}
-	owner, err := newExecutorID()
-	if err != nil {
-		fmt.Fprintf(stderr, "create executor ID: %v\n", err)
-		return 1
-	}
-	engine := newExecutionEngine(store, runtime, owner, providers, runtime.LLMTiers, registry, agentLimits)
-	result, err := engine.Execute(ctx, workflow.EngineRequest{
-		RunID: runID, Owner: owner, OutputPath: *outputPath,
-		Lease: workflow.LeaseSettings{TTL: runtime.LeaseTTL, RenewInterval: runtime.LeaseRenewInterval},
-	})
-	if err != nil {
-		fmt.Fprintf(stderr, "execute resumed run: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\nreport_path=%s\nreused=%t\n", runID, result.Status, result.Review.Completed, result.Aggregation.Confirmed, result.Aggregation.Advisory, result.Report.Report.OutputPath, result.Report.Reused)
+	fmt.Fprintf(stdout, "run_id=%s\nstatus=%s\ncompleted=%d\nconfirmed=%d\nadvisory=%d\nreport_path=%s\nreused=%t\n", runID, result.Status, result.Units.Completed, result.Aggregation.Confirmed, result.Aggregation.Advisory, result.Report.Report.OutputPath, result.Report.Reused)
 	return 0
-}
-
-// prepareRunForExecution 补齐 Engine 之前的可恢复阶段：首次抓取和 Review Unit 规划。
-// fetched 之后只读取持久化 Snapshot，不会跟随 PR 后续提交。
-func prepareRunForExecution(ctx context.Context, store *sqlite.Store, run domain.Run, now time.Time) (domain.Run, error) {
-	service := workflow.NewService(store)
-	var snapshot domain.ChangeSnapshot
-	if run.Status == domain.RunStatusCreated || run.Status == domain.RunStatusFetching {
-		ref, err := pullRequestRef(run)
-		if err != nil {
-			return domain.Run{}, fmt.Errorf("restore pull request reference: %w", err)
-		}
-		apiBaseURL := os.Getenv("GITHUB_API_BASE_URL")
-		if apiBaseURL == "" {
-			apiBaseURL = defaultGitHubAPI
-		}
-		adapter, err := scm.NewGitHubAdapter(nil, apiBaseURL, os.Getenv("GITHUB_TOKEN"))
-		if err != nil {
-			return domain.Run{}, fmt.Errorf("create GitHub adapter: %w", err)
-		}
-		if err := service.BeginFetch(ctx, run.ID, now); err != nil {
-			return domain.Run{}, err
-		}
-		snapshot, err = adapter.Fetch(ctx, ref)
-		if err != nil {
-			return domain.Run{}, fmt.Errorf("fetch pull request: %w", err)
-		}
-		snapshot = security.NewSanitizer().SanitizeSnapshot(snapshot).Snapshot
-		snapshot.CreatedAt = now
-		if err := service.CompleteFetch(ctx, run.ID, snapshot, snapshot.CreatedAt); err != nil {
-			return domain.Run{}, err
-		}
-		run.Status = domain.RunStatusFetched
-	}
-	if run.Status == domain.RunStatusFetched {
-		if snapshot.HeadSHA == "" {
-			var err error
-			snapshot, err = store.GetSnapshot(ctx, run.ID)
-			if err != nil {
-				return domain.Run{}, fmt.Errorf("get fetched snapshot: %w", err)
-			}
-		}
-		planTime := now
-		units := planner.New().Plan(planner.Request{
-			RunID: run.ID, HeadSHA: snapshot.HeadSHA, Diff: snapshot.Diff, Now: planTime,
-		})
-		if err := service.SavePlan(ctx, run.ID, units, planTime); err != nil {
-			return domain.Run{}, err
-		}
-		run.Status = domain.RunStatusPlanned
-	}
-	return run, nil
-}
-
-// newExecutorID 为一次 CLI 进程生成唯一的 lease owner。
-// 主机名和 PID 便于排查，随机后缀保证不同进程不会被误判为同一执行者。
-func newExecutorID() (string, error) {
-	randomSuffix, err := randomSuffix()
-	if err != nil {
-		return "", err
-	}
-
-	hostname, err := os.Hostname()
-	if err != nil || hostname == "" {
-		hostname = "unknown-host"
-	}
-	return fmt.Sprintf("cli-%s-%d-%s", hostname, os.Getpid(), randomSuffix), nil
-}
-
-// newRunID 为持久化 Run 生成不会与其他命令冲突的标识。
-func newRunID() (string, error) {
-	suffix, err := randomSuffix()
-	if err != nil {
-		return "", err
-	}
-	return "run-" + suffix, nil
-}
-
-func randomSuffix() (string, error) {
-	var randomBytes [8]byte
-	if _, err := rand.Read(randomBytes[:]); err != nil {
-		return "", fmt.Errorf("read random bytes: %w", err)
-	}
-	return hex.EncodeToString(randomBytes[:]), nil
 }
 
 // parseOptions 解析所有子命令共用的数据库与运行时配置参数。
@@ -581,81 +341,11 @@ func openStore(ctx context.Context, dbPath, configPath string) (*sqlite.Store, c
 	return store, runtime, nil
 }
 
-func newExecutionEngine(store *sqlite.Store, runtime config.Runtime, owner string, providers map[string]llm.Provider, tiers map[string]llm.Tier, registry *reviewtools.Registry, agentLimits reviewtools.AgentLimits) workflow.ExecutionEngine {
-	gateway := llm.NewGateway(budget.NewManager(store), llm.ByteUpperBoundCounter{}, providers, tiers)
-	reviewer := review.NewReviewer(gateway, runtime.DefaultLLMTier, runtime.MaxFindingsPerUnit)
-	if registry != nil {
-		reviewer = review.NewRecoverableAgentReviewer(gateway, runtime.DefaultLLMTier, runtime.MaxFindingsPerUnit, registry, agentLimits, store)
-	}
-	executor := review.NewExecutor(store, reviewer, "llm_review", owner)
-	runner := workflow.NewRunner(workflow.NewService(store), executor)
-	aggregator := verifier.NewAggregator(store, verifier.NewDefault())
-	reporter := report.NewGenerator(store)
-	return workflow.NewExecutionEngine(store, runner, aggregator, reporter)
-}
-
-func newToolRegistry(config reviewtools.Config, adapter *scm.GitHubAdapter, ref scm.PullRequestRef, snapshot domain.ChangeSnapshot) (*reviewtools.Registry, error) {
-	implementations := map[string]reviewtools.Tool{
-		"repository_file": reviewtools.NewRepositoryFileTool(adapter, ref, snapshot.HeadSHA),
-		"snapshot_search": reviewtools.NewSnapshotSearchTool(snapshot.Diff, 20),
-	}
-	return reviewtools.NewRegistry(config.Tools, implementations)
-}
-
-func pullRequestRef(run domain.Run) (scm.PullRequestRef, error) {
-	parts := strings.Split(run.Repository, "/")
-	if run.Provider != "github" || len(parts) != 2 || parts[0] == "" || parts[1] == "" || run.ChangeNumber <= 0 {
-		return scm.PullRequestRef{}, fmt.Errorf("unsupported persisted SCM identity")
-	}
-	return scm.PullRequestRef{Owner: parts[0], Repository: parts[1], Number: run.ChangeNumber}, nil
-}
-
 func configuredToolsPath() string {
 	if value := os.Getenv("REVIEW_AGENT_TOOLS_CONFIG"); value != "" {
 		return value
 	}
 	return defaultToolsPath
-}
-
-// providersForRuntime 只从环境变量读取凭据，并按 tier 配置构建 Provider Registry。
-func providersForRuntime(runtime config.Runtime) (map[string]llm.Provider, error) {
-	providers := make(map[string]llm.Provider)
-	for _, tier := range runtime.LLMTiers {
-		if _, exists := providers[tier.Provider]; exists {
-			continue
-		}
-		switch tier.Provider {
-		case "fake":
-			providers["fake"] = &llm.FakeProvider{Response: llm.Response{
-				Content: `{"findings":[]}`,
-				Usage:   &llm.TokenUsage{},
-			}}
-		case "openai":
-			baseURL := os.Getenv("OPENAI_API_BASE_URL")
-			if baseURL == "" {
-				baseURL = defaultOpenAIAPI
-			}
-			provider, err := llm.NewOpenAIProvider(&http.Client{Timeout: runtime.LLMRequestTimeout}, baseURL, os.Getenv("OPENAI_API_KEY"))
-			if err != nil {
-				return nil, err
-			}
-			providers["openai"] = provider
-		default:
-			return nil, fmt.Errorf("unsupported LLM provider %q", tier.Provider)
-		}
-	}
-	return providers, nil
-}
-
-// inactiveProviders 只用于 aggregating/reported 阶段；这些阶段不会调用 Provider。
-func inactiveProviders(tiers map[string]llm.Tier) map[string]llm.Provider {
-	providers := make(map[string]llm.Provider)
-	for _, tier := range tiers {
-		if _, exists := providers[tier.Provider]; !exists {
-			providers[tier.Provider] = &llm.FakeProvider{}
-		}
-	}
-	return providers
 }
 
 func printUsage(writer io.Writer) {

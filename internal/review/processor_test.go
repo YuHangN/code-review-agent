@@ -14,9 +14,9 @@ import (
 	"github.com/YuHangN/code-review-agent/internal/store/sqlite"
 )
 
-func TestExecutorCompletesUnitAndPersistsCandidatesWithTrace(t *testing.T) {
+func TestUnitProcessorCompletesUnitAndPersistsCandidatesWithTrace(t *testing.T) {
 	ctx := context.Background()
-	store := executorStore(t)
+	store := processorStore(t)
 	now := time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC)
 	reviewer := &stubReviewer{result: review.Result{
 		Prompt:      "sanitized prompt",
@@ -27,9 +27,9 @@ func TestExecutorCompletesUnitAndPersistsCandidatesWithTrace(t *testing.T) {
 		}},
 		Rejections: []review.Rejection{{Index: 1, Reason: "line 不是新增行"}},
 	}}
-	executor := review.NewExecutor(store, reviewer, "llm_review", "worker-a")
+	processor := review.NewUnitProcessor(store, reviewer, "llm_review", "worker-a")
 
-	outcome, err := executor.Execute(ctx, "unit-001", now)
+	outcome, err := processor.Process(ctx, "unit-001", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,14 +69,14 @@ func TestExecutorCompletesUnitAndPersistsCandidatesWithTrace(t *testing.T) {
 	}
 }
 
-func TestExecutorCheckpointsRecoverableReviewerFailure(t *testing.T) {
+func TestUnitProcessorCheckpointsRecoverableReviewerFailure(t *testing.T) {
 	ctx := context.Background()
-	store := executorStore(t)
+	store := processorStore(t)
 	const secret = "sk-provider-1234567890abcdef"
 	reviewer := &stubReviewer{result: review.Result{Prompt: "sanitized prompt"}, err: errors.New("provider unavailable: " + secret)}
-	executor := review.NewExecutor(store, reviewer, "llm_review", "worker-a")
+	processor := review.NewUnitProcessor(store, reviewer, "llm_review", "worker-a")
 
-	outcome, err := executor.Execute(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC))
+	outcome, err := processor.Process(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC))
 	if err == nil || !strings.Contains(err.Error(), "provider unavailable") {
 		t.Fatalf("Execute error = %v", err)
 	}
@@ -102,13 +102,13 @@ func TestExecutorCheckpointsRecoverableReviewerFailure(t *testing.T) {
 	}
 }
 
-func TestExecutorSkipsUnitWhenBudgetIsExhausted(t *testing.T) {
+func TestUnitProcessorSkipsUnitWhenBudgetIsExhausted(t *testing.T) {
 	ctx := context.Background()
-	store := executorStore(t)
+	store := processorStore(t)
 	reviewer := &stubReviewer{result: review.Result{Prompt: "sanitized prompt"}, err: budget.ErrLimitExceeded}
-	executor := review.NewExecutor(store, reviewer, "llm_review", "worker-a")
+	processor := review.NewUnitProcessor(store, reviewer, "llm_review", "worker-a")
 
-	outcome, err := executor.Execute(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC))
+	outcome, err := processor.Process(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("Execute error = %v, want budget skip without workflow failure", err)
 	}
@@ -124,9 +124,9 @@ func TestExecutorSkipsUnitWhenBudgetIsExhausted(t *testing.T) {
 	}
 }
 
-func TestExecutorSanitizesEveryPersistedTraceAndFindingField(t *testing.T) {
+func TestUnitProcessorSanitizesEveryPersistedTraceAndFindingField(t *testing.T) {
 	ctx := context.Background()
-	store := executorStore(t)
+	store := processorStore(t)
 	const secret = "sk-persisted-1234567890abcdef"
 	reviewer := &stubReviewer{result: review.Result{
 		Prompt: "prompt " + secret, RawResponse: "response " + secret,
@@ -136,9 +136,9 @@ func TestExecutorSanitizesEveryPersistedTraceAndFindingField(t *testing.T) {
 			Evidence: []string{"evidence " + secret}, Suggestion: "suggestion " + secret,
 		}},
 	}}
-	executor := review.NewExecutor(store, reviewer, "llm_review", "worker-a")
+	processor := review.NewUnitProcessor(store, reviewer, "llm_review", "worker-a")
 
-	outcome, err := executor.Execute(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC))
+	outcome, err := processor.Process(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,13 +156,13 @@ func TestExecutorSanitizesEveryPersistedTraceAndFindingField(t *testing.T) {
 	}
 }
 
-func TestExecutorRejectsProcessThatDoesNotOwnRunLease(t *testing.T) {
+func TestUnitProcessorRejectsProcessThatDoesNotOwnRunLease(t *testing.T) {
 	ctx := context.Background()
-	store := executorStore(t)
+	store := processorStore(t)
 	reviewer := &stubReviewer{}
-	executor := review.NewExecutor(store, reviewer, "llm_review", "worker-b")
+	processor := review.NewUnitProcessor(store, reviewer, "llm_review", "worker-b")
 
-	if _, err := executor.Execute(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC)); !errors.Is(err, sqlite.ErrLeaseHeld) {
+	if _, err := processor.Process(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC)); !errors.Is(err, sqlite.ErrLeaseHeld) {
 		t.Fatalf("Execute error = %v, want ErrLeaseHeld", err)
 	}
 	units, err := store.ListUnits(ctx, "run-001")
@@ -174,18 +174,18 @@ func TestExecutorRejectsProcessThatDoesNotOwnRunLease(t *testing.T) {
 	}
 }
 
-func TestExecutorCannotCommitAfterLeaseWasTakenOverDuringReview(t *testing.T) {
+func TestUnitProcessorCannotCommitAfterLeaseWasTakenOverDuringReview(t *testing.T) {
 	ctx := context.Background()
-	store := executorStore(t)
+	store := processorStore(t)
 	reviewer := &stubReviewer{result: review.Result{Prompt: "prompt", RawResponse: `{"findings":[]}`}}
 	reviewer.onReview = func() {
 		if _, err := store.ClaimRun(ctx, "run-001", "worker-b", time.Date(2026, 8, 22, 4, 0, 1, 0, time.UTC), time.Hour); err != nil {
 			t.Fatal(err)
 		}
 	}
-	executor := review.NewExecutor(store, reviewer, "llm_review", "worker-a")
+	processor := review.NewUnitProcessor(store, reviewer, "llm_review", "worker-a")
 
-	if _, err := executor.Execute(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC)); !errors.Is(err, sqlite.ErrLeaseHeld) {
+	if _, err := processor.Process(ctx, "unit-001", time.Date(2026, 8, 22, 3, 0, 0, 0, time.UTC)); !errors.Is(err, sqlite.ErrLeaseHeld) {
 		t.Fatalf("Execute error = %v, want ErrLeaseHeld", err)
 	}
 	units, err := store.ListUnits(ctx, "run-001")
@@ -212,7 +212,7 @@ func (stub *stubReviewer) Review(_ context.Context, request review.Request) (rev
 	return stub.result, stub.err
 }
 
-func executorStore(t *testing.T) *sqlite.Store {
+func processorStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 	ctx := context.Background()
 	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: 5 * time.Second})

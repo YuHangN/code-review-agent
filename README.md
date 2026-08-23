@@ -30,7 +30,8 @@ review-agent trace <trace-id>
 用户执行 run
   → main 把命令参数交给 CLI
   → CLI 识别 run，并解析 PR URL、预算和输出路径
-  → 读取 runtime.yaml，打开 SQLite 并检查数据库版本
+  → Application 读取配置、组装组件并驱动完整用例
+  → 打开 SQLite 并检查数据库版本
   → 写入 created Run，立即向用户输出 run_id
   → Run 进入 fetching，GitHub Adapter 获取 base/head SHA 和 diff
   → Security 排除敏感文件并脱敏 diff
@@ -96,13 +97,14 @@ PR URL
 ```text
 cmd/review-agent/          CLI 入口
 internal/
+  app/                     run/resume 用例与组件组装
   domain/                  核心领域模型
-  workflow/                Review 状态机与恢复编排
+  workflow/                planned 之后的状态推进、Unit 调度和 lease
   scm/                     GitHub Adapter 与统一 SCM 边界
   security/                Snapshot 与落盘内容的脱敏边界
   llm/                     预算保护后的模型 Provider
   budget/                  模型费用预留与结算
-  review/                  Prompt 执行与候选 Finding
+  review/                  Reviewer 与单个 Unit 的 checkpoint 处理
   tools/                   声明式 Registry 与固定 Snapshot 工具
   verifier/                Finding 证据校验和置信度分级
   report/                  Markdown 报告生成
