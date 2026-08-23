@@ -27,6 +27,8 @@ checkers:
   enabled: true
   docker_binary: docker
   image: code-review-agent-checker:go1.26-staticcheck2026.1
+  image_inspect_attempts: 3
+  image_inspect_retry_delay: 500ms
   cpus: "1"
   memory: 1g
   tmp_size: 1g

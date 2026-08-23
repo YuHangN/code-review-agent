@@ -22,14 +22,16 @@ type Definition struct {
 }
 
 type DockerSettings struct {
-	Binary            string
-	Image             string
-	CPUs              string
-	Memory            string
-	TmpSize           string
-	PIDs              int
-	DependencyTimeout time.Duration
-	Proxy             string
+	Binary                 string
+	Image                  string
+	ImageInspectAttempts   int
+	ImageInspectRetryDelay time.Duration
+	CPUs                   string
+	Memory                 string
+	TmpSize                string
+	PIDs                   int
+	DependencyTimeout      time.Duration
+	Proxy                  string
 }
 
 type CommandResult struct {
@@ -54,7 +56,7 @@ type ResolvingDockerRunner struct {
 }
 
 func NewResolvingDockerRunner(executor CommandExecutor, settings DockerSettings) (*ResolvingDockerRunner, error) {
-	if executor == nil || settings.Binary == "" || settings.Image == "" || settings.CPUs == "" || settings.Memory == "" || settings.TmpSize == "" || settings.PIDs <= 0 || settings.DependencyTimeout <= 0 || !strings.HasPrefix(settings.Proxy, "https://") {
+	if executor == nil || settings.Binary == "" || settings.Image == "" || settings.ImageInspectAttempts <= 0 || settings.ImageInspectRetryDelay <= 0 || settings.CPUs == "" || settings.Memory == "" || settings.TmpSize == "" || settings.PIDs <= 0 || settings.DependencyTimeout <= 0 || !strings.HasPrefix(settings.Proxy, "https://") {
 		return nil, fmt.Errorf("invalid resolving docker checker settings")
 	}
 	return &ResolvingDockerRunner{executor: executor, settings: settings}, nil
@@ -80,7 +82,7 @@ func (runner *ResolvingDockerRunner) resolve(ctx context.Context) (*DockerRunner
 	if runner.resolved != nil {
 		return runner.resolved, nil
 	}
-	image, err := ResolveImage(ctx, runner.executor, runner.settings.Binary, runner.settings.Image)
+	image, err := resolveImageWithRetry(ctx, runner.executor, runner.settings.Binary, runner.settings.Image, runner.settings.ImageInspectAttempts, runner.settings.ImageInspectRetryDelay)
 	if err != nil {
 		return nil, err
 	}
@@ -105,9 +107,34 @@ func ResolveImage(ctx context.Context, executor CommandExecutor, binary, image s
 	}
 	resolved := strings.TrimSpace(result.Output)
 	if result.ExitCode != 0 || !immutableImagePattern.MatchString(resolved) {
-		return "", fmt.Errorf("checker image is unavailable or not immutable")
+		if resolved == "" {
+			resolved = "Docker returned no image ID"
+		}
+		return "", fmt.Errorf("checker image %q is unavailable or not immutable: %s; run `make checker-image` from the review-agent source directory to build it", image, resolved)
 	}
 	return resolved, nil
+}
+
+func resolveImageWithRetry(ctx context.Context, executor CommandExecutor, binary, image string, attempts int, delay time.Duration) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		resolved, err := ResolveImage(ctx, executor, binary, image)
+		if err == nil {
+			return resolved, nil
+		}
+		lastErr = err
+		if attempt == attempts {
+			break
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return "", lastErr
 }
 
 func NewDockerRunner(executor CommandExecutor, settings DockerSettings) (DockerRunner, error) {

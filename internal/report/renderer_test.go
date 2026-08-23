@@ -43,7 +43,7 @@ func TestRenderProducesDeterministicReviewReport(t *testing.T) {
 		t.Fatal("same input generated different reports")
 	}
 	for _, want := range []string{
-		"# Code Review Report",
+		"# 代码审查报告",
 		"acme/payments #42",
 		"`base-123` → `head-456`",
 		"已审查 Unit：1 / 2",

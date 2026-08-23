@@ -125,7 +125,7 @@ func checkerFinding(runID string, diagnostic domain.CheckerDiagnostic, now time.
 		VerificationReason: "受限容器中的确定性静态检查器命中 PR 新增行",
 		Category:           "correctness", Severity: diagnostic.Severity, File: diagnostic.File, Line: diagnostic.Line,
 		Title: diagnostic.Code + " · " + diagnostic.Message, Explanation: diagnostic.Message,
-		Evidence:   []string{fmt.Sprintf("%s 在 %s:%d:%d 输出 %s", diagnostic.Checker, diagnostic.File, diagnostic.Line, diagnostic.Column, diagnostic.Code)},
+		Evidence:   []string{fmt.Sprintf("%s 在 %s:%d:%d 报告：%s（%s）", diagnostic.Checker, diagnostic.File, diagnostic.Line, diagnostic.Column, diagnostic.Message, diagnostic.Code)},
 		Suggestion: "根据静态检查器诊断修复代码，并在本地重新运行对应检查。", CreatedAt: now,
 	}
 }

@@ -32,7 +32,7 @@ func Render(input Input) (string, error) {
 	completed, skippedBudget := unitCoverage(input.Units)
 
 	var output strings.Builder
-	fmt.Fprintln(&output, "# Code Review Report")
+	fmt.Fprintln(&output, "# 代码审查报告")
 	fmt.Fprintln(&output)
 	fmt.Fprintf(&output, "**变更：** %s #%d  \n", singleLine(input.Run.Repository), input.Run.ChangeNumber)
 	fmt.Fprintf(&output, "**版本：** `%s` → `%s`\n\n", singleLine(input.Snapshot.BaseSHA), singleLine(input.Snapshot.HeadSHA))

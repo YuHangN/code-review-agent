@@ -34,7 +34,8 @@ type CheckerConfig struct {
 	Enabled                                           bool
 	DockerBinary, Image, CPUs, Memory, TmpSize, Proxy string
 	PIDs                                              int
-	DependencyTimeout                                 time.Duration
+	DependencyTimeout, ImageInspectRetryDelay         time.Duration
+	ImageInspectAttempts                              int
 	Definitions                                       []CheckerDefinition
 }
 
@@ -71,16 +72,18 @@ func LoadRuntime(path string) (Runtime, error) {
 			Tiers          map[string]rawLLMTier `yaml:"tiers"`
 		} `yaml:"llm"`
 		Checkers struct {
-			Enabled           bool   `yaml:"enabled"`
-			DockerBinary      string `yaml:"docker_binary"`
-			Image             string `yaml:"image"`
-			CPUs              string `yaml:"cpus"`
-			Memory            string `yaml:"memory"`
-			TmpSize           string `yaml:"tmp_size"`
-			PIDs              int    `yaml:"pids"`
-			DependencyTimeout string `yaml:"dependency_timeout"`
-			Proxy             string `yaml:"proxy"`
-			Definitions       []struct {
+			Enabled                bool   `yaml:"enabled"`
+			DockerBinary           string `yaml:"docker_binary"`
+			Image                  string `yaml:"image"`
+			ImageInspectAttempts   int    `yaml:"image_inspect_attempts"`
+			ImageInspectRetryDelay string `yaml:"image_inspect_retry_delay"`
+			CPUs                   string `yaml:"cpus"`
+			Memory                 string `yaml:"memory"`
+			TmpSize                string `yaml:"tmp_size"`
+			PIDs                   int    `yaml:"pids"`
+			DependencyTimeout      string `yaml:"dependency_timeout"`
+			Proxy                  string `yaml:"proxy"`
+			Definitions            []struct {
 				Name           string `yaml:"name"`
 				Implementation string `yaml:"implementation"`
 				Timeout        string `yaml:"timeout"`
@@ -106,11 +109,18 @@ func LoadRuntime(path string) (Runtime, error) {
 		return Runtime{}, fmt.Errorf("validate runtime config: %w", err)
 	}
 	if raw.Checkers.Enabled {
+		if raw.Checkers.ImageInspectAttempts == 0 {
+			raw.Checkers.ImageInspectAttempts = 3
+		}
+		if raw.Checkers.ImageInspectRetryDelay == "" {
+			raw.Checkers.ImageInspectRetryDelay = "500ms"
+		}
 		dependencyTimeout, parseErr := time.ParseDuration(raw.Checkers.DependencyTimeout)
-		if parseErr != nil || dependencyTimeout <= 0 || raw.Checkers.DockerBinary == "" || raw.Checkers.Image == "" || raw.Checkers.CPUs == "" || raw.Checkers.Memory == "" || raw.Checkers.TmpSize == "" || raw.Checkers.PIDs <= 0 || !strings.HasPrefix(raw.Checkers.Proxy, "https://") || len(raw.Checkers.Definitions) == 0 {
+		imageInspectRetryDelay, retryParseErr := time.ParseDuration(raw.Checkers.ImageInspectRetryDelay)
+		if parseErr != nil || dependencyTimeout <= 0 || retryParseErr != nil || imageInspectRetryDelay <= 0 || raw.Checkers.ImageInspectAttempts <= 0 || raw.Checkers.DockerBinary == "" || raw.Checkers.Image == "" || raw.Checkers.CPUs == "" || raw.Checkers.Memory == "" || raw.Checkers.TmpSize == "" || raw.Checkers.PIDs <= 0 || !strings.HasPrefix(raw.Checkers.Proxy, "https://") || len(raw.Checkers.Definitions) == 0 {
 			return Runtime{}, fmt.Errorf("validate checker config")
 		}
-		runtime.Checkers = CheckerConfig{Enabled: true, DockerBinary: raw.Checkers.DockerBinary, Image: raw.Checkers.Image, CPUs: raw.Checkers.CPUs, Memory: raw.Checkers.Memory, TmpSize: raw.Checkers.TmpSize, PIDs: raw.Checkers.PIDs, DependencyTimeout: dependencyTimeout, Proxy: raw.Checkers.Proxy}
+		runtime.Checkers = CheckerConfig{Enabled: true, DockerBinary: raw.Checkers.DockerBinary, Image: raw.Checkers.Image, ImageInspectAttempts: raw.Checkers.ImageInspectAttempts, ImageInspectRetryDelay: imageInspectRetryDelay, CPUs: raw.Checkers.CPUs, Memory: raw.Checkers.Memory, TmpSize: raw.Checkers.TmpSize, PIDs: raw.Checkers.PIDs, DependencyTimeout: dependencyTimeout, Proxy: raw.Checkers.Proxy}
 		for _, definition := range raw.Checkers.Definitions {
 			timeout, parseErr := time.ParseDuration(definition.Timeout)
 			if parseErr != nil || timeout <= 0 || definition.Name == "" || (definition.Implementation != "go_vet" && definition.Implementation != "staticcheck") {

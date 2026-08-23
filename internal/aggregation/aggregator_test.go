@@ -50,6 +50,10 @@ func TestAggregatorIncludesCheckerDiagnosticAsConfirmed(t *testing.T) {
 	if store.saved[0].CandidateID != "" || store.saved[0].VerificationSource != "checker:staticcheck" || store.saved[0].TraceID != "trace-checker" {
 		t.Fatalf("checker finding = %#v", store.saved[0])
 	}
+	wantEvidence := "staticcheck 在 main.go:4:2 报告：invalid printf argument（SA1006）"
+	if len(store.saved[0].Evidence) != 1 || store.saved[0].Evidence[0] != wantEvidence {
+		t.Fatalf("checker evidence = %#v, want %q", store.saved[0].Evidence, wantEvidence)
+	}
 }
 
 func candidate(id, category string, line int, title string) domain.CandidateFindingRecord {

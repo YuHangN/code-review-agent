@@ -332,7 +332,7 @@ func (application Application) checkerProcessor(ctx context.Context, runID strin
 		return checker.Processor{}, fmt.Errorf("SCM adapter does not support fixed archives")
 	}
 	executor := checker.OSExecutor{}
-	runner, err := checker.NewResolvingDockerRunner(executor, checker.DockerSettings{Binary: application.runtime.Checkers.DockerBinary, Image: application.runtime.Checkers.Image, CPUs: application.runtime.Checkers.CPUs, Memory: application.runtime.Checkers.Memory, TmpSize: application.runtime.Checkers.TmpSize, PIDs: application.runtime.Checkers.PIDs, DependencyTimeout: application.runtime.Checkers.DependencyTimeout, Proxy: application.runtime.Checkers.Proxy})
+	runner, err := checker.NewResolvingDockerRunner(executor, checker.DockerSettings{Binary: application.runtime.Checkers.DockerBinary, Image: application.runtime.Checkers.Image, ImageInspectAttempts: application.runtime.Checkers.ImageInspectAttempts, ImageInspectRetryDelay: application.runtime.Checkers.ImageInspectRetryDelay, CPUs: application.runtime.Checkers.CPUs, Memory: application.runtime.Checkers.Memory, TmpSize: application.runtime.Checkers.TmpSize, PIDs: application.runtime.Checkers.PIDs, DependencyTimeout: application.runtime.Checkers.DependencyTimeout, Proxy: application.runtime.Checkers.Proxy})
 	if err != nil {
 		return checker.Processor{}, err
 	}

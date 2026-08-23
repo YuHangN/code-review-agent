@@ -38,6 +38,8 @@ checkers:
   enabled: true
   docker_binary: docker
   image: review-agent-checker:test
+  image_inspect_attempts: 3
+  image_inspect_retry_delay: 500ms
   cpus: "1"
   memory: 512m
   tmp_size: 1g
@@ -88,7 +90,7 @@ checkers:
 	if economy.Provider != "fake" || economy.Model != "fake-economy-reviewer" || economy.MaxOutputTokens != 1200 {
 		t.Fatalf("economy tier = %#v", economy)
 	}
-	if !runtime.Checkers.Enabled || runtime.Checkers.TmpSize != "1g" || len(runtime.Checkers.Definitions) != 1 || runtime.Checkers.Definitions[0].Name != "go_vet" {
+	if !runtime.Checkers.Enabled || runtime.Checkers.TmpSize != "1g" || runtime.Checkers.ImageInspectAttempts != 3 || runtime.Checkers.ImageInspectRetryDelay != 500*time.Millisecond || len(runtime.Checkers.Definitions) != 1 || runtime.Checkers.Definitions[0].Name != "go_vet" {
 		t.Fatalf("checkers = %#v", runtime.Checkers)
 	}
 }

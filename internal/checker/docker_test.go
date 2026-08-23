@@ -51,7 +51,7 @@ func TestDockerRunnerRejectsUnknownImplementation(t *testing.T) {
 
 func TestResolvingDockerRunnerInspectsImageLazilyAndOnlyOnce(t *testing.T) {
 	executor := &recordingExecutor{result: checker.CommandResult{Output: "sha256:" + strings.Repeat("b", 64)}}
-	runner, err := checker.NewResolvingDockerRunner(executor, checker.DockerSettings{Binary: "docker", Image: "checker:local", CPUs: "1", Memory: "1g", TmpSize: "1g", PIDs: 128, DependencyTimeout: time.Minute, Proxy: "https://proxy.golang.org"})
+	runner, err := checker.NewResolvingDockerRunner(executor, checker.DockerSettings{Binary: "docker", Image: "checker:local", CPUs: "1", Memory: "1g", TmpSize: "1g", PIDs: 128, DependencyTimeout: time.Minute, ImageInspectAttempts: 3, ImageInspectRetryDelay: time.Millisecond, Proxy: "https://proxy.golang.org"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,9 +69,61 @@ func TestResolvingDockerRunnerInspectsImageLazilyAndOnlyOnce(t *testing.T) {
 	}
 }
 
+func TestResolvingDockerRunnerRetriesTransientImageInspectFailure(t *testing.T) {
+	executor := &sequenceExecutor{results: []checker.CommandResult{
+		{Output: "Error response from daemon: No such image", ExitCode: 1},
+		{Output: "sha256:" + strings.Repeat("c", 64)},
+	}}
+	runner, err := checker.NewResolvingDockerRunner(executor, checker.DockerSettings{
+		Binary: "docker", Image: "checker:local", CPUs: "1", Memory: "1g", TmpSize: "1g", PIDs: 128,
+		DependencyTimeout: time.Minute, ImageInspectAttempts: 3, ImageInspectRetryDelay: time.Millisecond, Proxy: "https://proxy.golang.org",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.Prepare(context.Background(), "/source", "/cache"); err != nil {
+		t.Fatal(err)
+	}
+	if executor.calls != 3 {
+		t.Fatalf("calls = %d, want two inspect attempts and one prepare", executor.calls)
+	}
+}
+
+func TestResolvingDockerRunnerReportsLastImageInspectError(t *testing.T) {
+	executor := &sequenceExecutor{results: []checker.CommandResult{
+		{Output: "first failure", ExitCode: 1},
+		{Output: "Error response from daemon: No such image: checker:local", ExitCode: 1},
+	}}
+	runner, err := checker.NewResolvingDockerRunner(executor, checker.DockerSettings{
+		Binary: "docker", Image: "checker:local", CPUs: "1", Memory: "1g", TmpSize: "1g", PIDs: 128,
+		DependencyTimeout: time.Minute, ImageInspectAttempts: 2, ImageInspectRetryDelay: time.Millisecond, Proxy: "https://proxy.golang.org",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Prepare(context.Background(), "/source", "/cache")
+	if err == nil || !strings.Contains(err.Error(), "No such image: checker:local") || !strings.Contains(err.Error(), "make checker-image") {
+		t.Fatalf("error = %v, want final Docker diagnostic and recovery command", err)
+	}
+}
+
 type recordingExecutor struct {
 	calls  [][]string
 	result checker.CommandResult
+}
+
+type sequenceExecutor struct {
+	results []checker.CommandResult
+	calls   int
+}
+
+func (executor *sequenceExecutor) Execute(_ context.Context, _ string, _ []string) (checker.CommandResult, error) {
+	index := executor.calls
+	executor.calls++
+	if index >= len(executor.results) {
+		return checker.CommandResult{}, nil
+	}
+	return executor.results[index], nil
 }
 
 func (executor *recordingExecutor) Execute(_ context.Context, binary string, arguments []string) (checker.CommandResult, error) {
