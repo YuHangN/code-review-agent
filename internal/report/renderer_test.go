@@ -17,7 +17,13 @@ func TestRenderProducesDeterministicReviewReport(t *testing.T) {
 			{ID: "unit-a", Status: domain.UnitStatusCompleted},
 			{ID: "unit-b", Status: domain.UnitStatusSkippedBudget},
 		},
-		Budget: budget.Summary{ActualMicros: 420_000, CommittedMicros: 420_000},
+		Budget: budget.Summary{
+			ActualMicros: 420_000, CommittedMicros: 420_000,
+			Tiers: []budget.TierSummary{
+				{Name: "economy", SettledCalls: 3, ActualMicros: 120_000},
+				{Name: "strong", SettledCalls: 2, ActualMicros: 300_000},
+			},
+		},
 		Findings: []domain.VerifiedFinding{
 			{ID: "finding-advisory", TraceID: "trace-advisory", Confidence: domain.ConfidenceAdvisory, VerificationSource: "llm_reasoning_only", VerificationReason: "只有模型推理", Severity: "medium", File: "cache.go", Line: 8, Title: "共享 map 可能并发访问", Explanation: "可能发生竞态", Evidence: []string{"goroutine 写入 map"}, Suggestion: "检查同步方式"},
 			{ID: "finding-confirmed", TraceID: "trace-confirmed", Confidence: domain.ConfidenceConfirmed, VerificationSource: "rule:redacted_secret_assignment", VerificationReason: "规则确定性命中", Severity: "high", File: "config.yaml", Line: 2, Title: "配置中包含凭据", Explanation: "凭据写入源码", Evidence: []string{"Secret Scanner 命中"}, Suggestion: "改用密钥服务"},
@@ -42,6 +48,7 @@ func TestRenderProducesDeterministicReviewReport(t *testing.T) {
 		"已审查 Unit：1 / 2",
 		"预算跳过 Unit：1",
 		"$0.420000 / $10.000000",
+		"模型 Tier：economy 3 次（$0.120000），strong 2 次（$0.300000）",
 		"## 高置信度，可直接采纳（1）",
 		"config.yaml:2",
 		"rule:redacted_secret_assignment",

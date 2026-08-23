@@ -19,11 +19,18 @@ review:
   max_findings_per_unit: 5
 llm:
   request_timeout: 90s
-  default_tier: economy
+  default_tier: strong
+  fallback_order: [strong, economy]
   tiers:
+    strong:
+      provider: fake
+      model: fake-strong-reviewer
+      input_price_micros_per_million_tokens: 5000000
+      output_price_micros_per_million_tokens: 10000000
+      max_output_tokens: 1200
     economy:
       provider: fake
-      model: fake-reviewer
+      model: fake-economy-reviewer
       input_price_micros_per_million_tokens: 2000000
       output_price_micros_per_million_tokens: 4000000
       max_output_tokens: 1200
@@ -50,15 +57,52 @@ llm:
 	if runtime.MaxFindingsPerUnit != 5 {
 		t.Fatalf("max findings per unit = %d, want 5", runtime.MaxFindingsPerUnit)
 	}
-	if runtime.DefaultLLMTier != "economy" {
-		t.Fatalf("default LLM tier = %q, want economy", runtime.DefaultLLMTier)
+	if runtime.DefaultLLMTier != "strong" {
+		t.Fatalf("default LLM tier = %q, want strong", runtime.DefaultLLMTier)
+	}
+	if len(runtime.LLMFallbackOrder) != 2 || runtime.LLMFallbackOrder[0] != "strong" || runtime.LLMFallbackOrder[1] != "economy" {
+		t.Fatalf("LLM fallback order = %v, want [strong economy]", runtime.LLMFallbackOrder)
 	}
 	if runtime.LLMRequestTimeout != 90*time.Second {
 		t.Fatalf("LLM request timeout = %s, want 90s", runtime.LLMRequestTimeout)
 	}
-	tier := runtime.LLMTiers["economy"]
-	if tier.Provider != "fake" || tier.Model != "fake-reviewer" || tier.MaxOutputTokens != 1200 {
-		t.Fatalf("economy tier = %#v", tier)
+	strong := runtime.LLMTiers["strong"]
+	if strong.Provider != "fake" || strong.Model != "fake-strong-reviewer" || strong.MaxOutputTokens != 1200 {
+		t.Fatalf("strong tier = %#v", strong)
+	}
+	economy := runtime.LLMTiers["economy"]
+	if economy.Provider != "fake" || economy.Model != "fake-economy-reviewer" || economy.MaxOutputTokens != 1200 {
+		t.Fatalf("economy tier = %#v", economy)
+	}
+}
+
+func TestLoadRuntimeRejectsUnknownFallbackTier(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime.yaml")
+	if err := os.WriteFile(path, []byte(`runtime:
+  lease_ttl: 60s
+  lease_renew_interval: 20s
+  sqlite_busy_timeout: 5s
+review:
+  default_budget_cents: 1000
+  currency: USD
+  max_findings_per_unit: 5
+llm:
+  request_timeout: 90s
+  default_tier: economy
+  fallback_order: [economy, missing]
+  tiers:
+    economy:
+      provider: fake
+      model: fake-reviewer
+      input_price_micros_per_million_tokens: 2000000
+      output_price_micros_per_million_tokens: 4000000
+      max_output_tokens: 1200
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadRuntime(path); err == nil {
+		t.Fatal("LoadRuntime succeeded, want unknown fallback tier error")
 	}
 }
 

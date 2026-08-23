@@ -8,8 +8,15 @@ review:
   max_findings_per_unit: 5
 llm:
   request_timeout: 90s
-  default_tier: economy
+  default_tier: strong
+  fallback_order: [strong, economy]
   tiers:
+    strong:
+      provider: openai
+      model: gpt-5.4
+      input_price_micros_per_million_tokens: 2500000
+      output_price_micros_per_million_tokens: 15000000
+      max_output_tokens: 4000
     economy:
       provider: openai
       model: gpt-5.4-mini

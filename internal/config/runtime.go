@@ -21,6 +21,7 @@ type Runtime struct {
 	MaxFindingsPerUnit int
 	LLMRequestTimeout  time.Duration
 	DefaultLLMTier     string
+	LLMFallbackOrder   []string
 	LLMTiers           map[string]llm.Tier
 }
 
@@ -53,6 +54,7 @@ func LoadRuntime(path string) (Runtime, error) {
 		LLM struct {
 			RequestTimeout string                `yaml:"request_timeout"`
 			DefaultTier    string                `yaml:"default_tier"`
+			FallbackOrder  []string              `yaml:"fallback_order"`
 			Tiers          map[string]rawLLMTier `yaml:"tiers"`
 		} `yaml:"llm"`
 	}
@@ -70,14 +72,14 @@ func LoadRuntime(path string) (Runtime, error) {
 			MaxOutputTokens:             tier.MaxOutputTokens,
 		}
 	}
-	runtime, err := parseRuntime(raw.Runtime.LeaseTTL, raw.Runtime.LeaseRenewInterval, raw.Runtime.SQLiteBusyTimeout, raw.Review.DefaultBudgetCents, raw.Review.Currency, raw.Review.MaxFindingsPerUnit, raw.LLM.RequestTimeout, raw.LLM.DefaultTier, tiers)
+	runtime, err := parseRuntime(raw.Runtime.LeaseTTL, raw.Runtime.LeaseRenewInterval, raw.Runtime.SQLiteBusyTimeout, raw.Review.DefaultBudgetCents, raw.Review.Currency, raw.Review.MaxFindingsPerUnit, raw.LLM.RequestTimeout, raw.LLM.DefaultTier, raw.LLM.FallbackOrder, tiers)
 	if err != nil {
 		return Runtime{}, fmt.Errorf("validate runtime config: %w", err)
 	}
 	return runtime, nil
 }
 
-func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaultBudgetCents int64, currency string, maxFindingsPerUnit int, llmRequestTimeout, defaultLLMTier string, tiers map[string]llm.Tier) (Runtime, error) {
+func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaultBudgetCents int64, currency string, maxFindingsPerUnit int, llmRequestTimeout, defaultLLMTier string, fallbackOrder []string, tiers map[string]llm.Tier) (Runtime, error) {
 	ttl, err := time.ParseDuration(leaseTTL)
 	if err != nil || ttl <= 0 {
 		return Runtime{}, fmt.Errorf("lease_ttl must be a positive duration")
@@ -111,6 +113,22 @@ func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaul
 	if _, ok := tiers[defaultLLMTier]; !ok {
 		return Runtime{}, fmt.Errorf("llm.default_tier %q is not configured", defaultLLMTier)
 	}
+	if len(fallbackOrder) == 0 {
+		fallbackOrder = []string{defaultLLMTier}
+	}
+	if fallbackOrder[0] != defaultLLMTier {
+		return Runtime{}, fmt.Errorf("llm.fallback_order must start with default_tier %q", defaultLLMTier)
+	}
+	seenFallbackTiers := make(map[string]struct{}, len(fallbackOrder))
+	for _, name := range fallbackOrder {
+		if _, ok := tiers[name]; !ok {
+			return Runtime{}, fmt.Errorf("llm.fallback_order tier %q is not configured", name)
+		}
+		if _, exists := seenFallbackTiers[name]; exists {
+			return Runtime{}, fmt.Errorf("llm.fallback_order contains duplicate tier %q", name)
+		}
+		seenFallbackTiers[name] = struct{}{}
+	}
 	for name, tier := range tiers {
 		if strings.TrimSpace(name) == "" || strings.TrimSpace(tier.Provider) == "" || strings.TrimSpace(tier.Model) == "" || tier.InputPriceMicrosPerMillion <= 0 || tier.OutputPriceMicrosPerMillion <= 0 || tier.MaxOutputTokens <= 0 {
 			return Runtime{}, fmt.Errorf("llm tier %q is invalid", name)
@@ -126,6 +144,7 @@ func parseRuntime(leaseTTL, leaseRenewInterval, sqliteBusyTimeout string, defaul
 		MaxFindingsPerUnit: maxFindingsPerUnit,
 		LLMRequestTimeout:  requestTimeout,
 		DefaultLLMTier:     defaultLLMTier,
+		LLMFallbackOrder:   append([]string(nil), fallbackOrder...),
 		LLMTiers:           tiers,
 	}, nil
 }

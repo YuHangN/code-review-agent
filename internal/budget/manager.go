@@ -42,6 +42,14 @@ type Summary struct {
 	ReservedMicros  int64
 	ActualMicros    int64
 	CommittedMicros int64
+	Tiers           []TierSummary
+}
+
+// TierSummary 汇总一个模型 Tier 已结算的调用次数和真实费用。
+type TierSummary struct {
+	Name         string
+	SettledCalls int
+	ActualMicros int64
 }
 
 // Store 是 Manager 所需的最小原子持久化能力。

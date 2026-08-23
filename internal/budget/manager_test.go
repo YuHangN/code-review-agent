@@ -50,6 +50,9 @@ func TestSettleChargesActualAndReturnsUnusedReservation(t *testing.T) {
 	if summary.ActualMicros != 30 || summary.ReservedMicros != 70 || summary.CommittedMicros != 100 {
 		t.Fatalf("summary = %#v", summary)
 	}
+	if len(summary.Tiers) != 1 || summary.Tiers[0].Name != "strong" || summary.Tiers[0].SettledCalls != 1 || summary.Tiers[0].ActualMicros != 30 {
+		t.Fatalf("tier summary = %#v", summary.Tiers)
+	}
 }
 
 func TestReleaseReturnsFailedCallReservation(t *testing.T) {

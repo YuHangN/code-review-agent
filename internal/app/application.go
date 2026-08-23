@@ -269,9 +269,9 @@ func (application Application) fetchSnapshot(ctx context.Context, run domain.Run
 
 func (application Application) execute(ctx context.Context, runID, owner, outputPath string, providers map[string]llm.Provider, registry *reviewtools.Registry, agentLimits reviewtools.AgentLimits) (workflow.Result, error) {
 	gateway := llm.NewGateway(budget.NewManager(application.store), llm.ByteUpperBoundCounter{}, providers, application.runtime.LLMTiers)
-	reviewer := review.NewReviewer(gateway, application.runtime.DefaultLLMTier, application.runtime.MaxFindingsPerUnit)
+	reviewer := review.NewReviewer(gateway, application.runtime.LLMFallbackOrder, application.runtime.MaxFindingsPerUnit)
 	if registry != nil {
-		reviewer = review.NewRecoverableAgentReviewer(gateway, application.runtime.DefaultLLMTier, application.runtime.MaxFindingsPerUnit, registry, agentLimits, application.store)
+		reviewer = review.NewRecoverableAgentReviewer(gateway, application.runtime.LLMFallbackOrder, application.runtime.MaxFindingsPerUnit, registry, agentLimits, application.store)
 	}
 	processor := review.NewUnitProcessor(application.store, reviewer, "llm_review", owner)
 	flow := workflow.New(application.store, processor, verifier.NewAggregator(application.store, verifier.NewDefault()), report.NewGenerator(application.store))

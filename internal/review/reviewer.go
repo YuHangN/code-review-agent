@@ -50,7 +50,6 @@ type Request struct {
 	Owner  string
 	Unit   domain.ReviewUnit
 	Diff   string
-	Tier   string
 }
 
 // Result 保留 Prompt 和原始模型回复，供后续 finding trace 使用。
@@ -94,35 +93,31 @@ type AgentCheckpointStore interface {
 // Reviewer 负责生成 Prompt，并将模型输出解析为候选问题。
 type Reviewer struct {
 	caller      Caller
-	defaultTier string
+	tierOrder   []string
 	maxFindings int
 	registry    *tools.Registry
 	limits      tools.AgentLimits
 	checkpoint  AgentCheckpointStore
 }
 
-func NewReviewer(caller Caller, defaultTier string, maxFindings int) Reviewer {
-	return Reviewer{caller: caller, defaultTier: defaultTier, maxFindings: maxFindings}
+func NewReviewer(caller Caller, tierOrder []string, maxFindings int) Reviewer {
+	return Reviewer{caller: caller, tierOrder: append([]string(nil), tierOrder...), maxFindings: maxFindings}
 }
 
 // NewAgentReviewer 创建只能调用 Registry 已授权工具的结构化 Reviewer Agent。
-func NewAgentReviewer(caller Caller, defaultTier string, maxFindings int, registry *tools.Registry, limits tools.AgentLimits) Reviewer {
-	return Reviewer{caller: caller, defaultTier: defaultTier, maxFindings: maxFindings, registry: registry, limits: limits}
+func NewAgentReviewer(caller Caller, tierOrder []string, maxFindings int, registry *tools.Registry, limits tools.AgentLimits) Reviewer {
+	return Reviewer{caller: caller, tierOrder: append([]string(nil), tierOrder...), maxFindings: maxFindings, registry: registry, limits: limits}
 }
 
 // NewRecoverableAgentReviewer 在 Agent Loop 上增加逐轮持久化与恢复。
-func NewRecoverableAgentReviewer(caller Caller, defaultTier string, maxFindings int, registry *tools.Registry, limits tools.AgentLimits, checkpoint AgentCheckpointStore) Reviewer {
-	return Reviewer{caller: caller, defaultTier: defaultTier, maxFindings: maxFindings, registry: registry, limits: limits, checkpoint: checkpoint}
+func NewRecoverableAgentReviewer(caller Caller, tierOrder []string, maxFindings int, registry *tools.Registry, limits tools.AgentLimits, checkpoint AgentCheckpointStore) Reviewer {
+	return Reviewer{caller: caller, tierOrder: append([]string(nil), tierOrder...), maxFindings: maxFindings, registry: registry, limits: limits, checkpoint: checkpoint}
 }
 
 // Review 只产生 Candidate Finding；证据确认和置信度分类由 Verifier 完成。
 func (reviewer Reviewer) Review(ctx context.Context, request Request) (Result, error) {
-	if reviewer.caller == nil || reviewer.defaultTier == "" || reviewer.maxFindings <= 0 || request.CallID == "" || request.Unit.ID == "" || request.Unit.RunID == "" || request.Unit.FilePath == "" || strings.TrimSpace(request.Diff) == "" {
+	if reviewer.caller == nil || len(reviewer.tierOrder) == 0 || reviewer.maxFindings <= 0 || request.CallID == "" || request.Unit.ID == "" || request.Unit.RunID == "" || request.Unit.FilePath == "" || strings.TrimSpace(request.Diff) == "" {
 		return Result{}, ErrInvalidRequest
-	}
-	tier := request.Tier
-	if tier == "" {
-		tier = reviewer.defaultTier
 	}
 	sanitizedInput := security.NewSanitizer().SanitizeSnapshot(domain.ChangeSnapshot{Diff: request.Diff})
 	prompt, err := reviewer.buildPrompt(request.Unit, sanitizedInput.Snapshot.Diff)
@@ -130,11 +125,11 @@ func (reviewer Reviewer) Review(ctx context.Context, request Request) (Result, e
 		return Result{}, err
 	}
 	if reviewer.registry != nil {
-		return reviewer.reviewWithTools(ctx, request, tier, prompt, sanitizedInput.Snapshot.Diff)
+		return reviewer.reviewWithTools(ctx, request, prompt, sanitizedInput.Snapshot.Diff)
 	}
 	result := Result{Prompt: prompt}
 	response, err := reviewer.caller.Call(ctx, llm.CallRequest{
-		ID: request.CallID, RunID: request.Unit.RunID, UnitID: request.Unit.ID, Tier: tier, Prompt: prompt,
+		ID: request.CallID, RunID: request.Unit.RunID, UnitID: request.Unit.ID, TierOrder: reviewer.tierOrder, Prompt: prompt,
 	})
 	if err != nil {
 		return result, fmt.Errorf("call reviewer model: %w", err)
@@ -149,7 +144,7 @@ func (reviewer Reviewer) Review(ctx context.Context, request Request) (Result, e
 	return result, nil
 }
 
-func (reviewer Reviewer) reviewWithTools(ctx context.Context, request Request, tier, basePrompt, sanitizedDiff string) (Result, error) {
+func (reviewer Reviewer) reviewWithTools(ctx context.Context, request Request, basePrompt, sanitizedDiff string) (Result, error) {
 	result := Result{Prompt: basePrompt}
 	if reviewer.limits.MaxRounds <= 0 || reviewer.limits.MaxToolCalls <= 0 || (reviewer.checkpoint != nil && request.Owner == "") {
 		return result, ErrInvalidRequest
@@ -197,7 +192,7 @@ func (reviewer Reviewer) reviewWithTools(ctx context.Context, request Request, t
 	for round := startRound; round <= reviewer.limits.MaxRounds; round++ {
 		callID := fmt.Sprintf("%s-round-%d", request.CallID, round)
 		response, err := reviewer.caller.Call(ctx, llm.CallRequest{
-			ID: callID, RunID: request.Unit.RunID, UnitID: request.Unit.ID, Tier: tier, Prompt: prompt,
+			ID: callID, RunID: request.Unit.RunID, UnitID: request.Unit.ID, TierOrder: reviewer.tierOrder, Prompt: prompt,
 		})
 		step := AgentStep{Round: round, CallID: callID, Prompt: prompt}
 		if err != nil {

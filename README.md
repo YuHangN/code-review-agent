@@ -24,6 +24,8 @@ review-agent trace <trace-id>
 
 真实 `run/resume` 从 `GITHUB_TOKEN` 和 `OPENAI_API_KEY` 环境变量读取凭据；凭据不会写入配置、SQLite、Trace 或报告。模型、价格和请求超时位于 `config/runtime.yaml`，Agent 上限和工具声明位于 `config/tools.yaml`。
 
+`llm.fallback_order` 定义每轮模型调用的预算降级顺序。只有当前 Tier 无法预留预算时才尝试下一级；默认从 `gpt-5.4` 的 `strong` Tier 降到 `gpt-5.4-mini` 的 `economy` Tier，全部无法预留时才将 Unit 标记为 `skipped_budget`。
+
 ## 整体链路框架
 
 ```text

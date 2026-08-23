@@ -32,11 +32,11 @@ type Tier struct {
 
 // CallRequest 是一次可独立记账的模型调用。
 type CallRequest struct {
-	ID     string
-	RunID  string
-	UnitID string
-	Tier   string
-	Prompt string
+	ID        string
+	RunID     string
+	UnitID    string
+	TierOrder []string
+	Prompt    string
 }
 
 // GenerateRequest 是传给具体 Provider 的统一请求。
@@ -56,6 +56,7 @@ type TokenUsage struct {
 type Response struct {
 	Content string
 	Usage   *TokenUsage
+	Tier    string
 }
 
 // Provider 隔离不同模型服务的 API 差异。
@@ -89,21 +90,27 @@ func NewGateway(ledger BudgetLedger, counter TokenCounter, providers map[string]
 
 // Call 完成“计算上界、预留、调用、结算或释放”的单次预算闭环。
 func (gateway Gateway) Call(ctx context.Context, request CallRequest) (Response, error) {
-	if request.ID == "" || request.RunID == "" || request.UnitID == "" || request.Tier == "" || strings.TrimSpace(request.Prompt) == "" || gateway.ledger == nil || gateway.counter == nil {
+	if request.ID == "" || request.RunID == "" || request.UnitID == "" || len(request.TierOrder) == 0 || strings.TrimSpace(request.Prompt) == "" || gateway.ledger == nil || gateway.counter == nil {
 		return Response{}, ErrInvalidCall
 	}
-	tier, ok := gateway.tiers[request.Tier]
-	if !ok {
-		return Response{}, fmt.Errorf("%w: %s", ErrUnknownTier, request.Tier)
-	}
-	if err := validateTier(tier); err != nil {
+	if err := gateway.validateTierOrder(request.TierOrder); err != nil {
 		return Response{}, err
 	}
-	provider, ok := gateway.providers[tier.Provider]
-	if !ok || provider == nil {
-		return Response{}, fmt.Errorf("%w: %s", ErrUnknownProvider, tier.Provider)
+	var limitErr error
+	for _, tierName := range request.TierOrder {
+		response, err := gateway.callTier(ctx, request, tierName)
+		if errors.Is(err, budget.ErrLimitExceeded) {
+			limitErr = err
+			continue
+		}
+		return response, err
 	}
+	return Response{}, limitErr
+}
 
+func (gateway Gateway) callTier(ctx context.Context, request CallRequest, tierName string) (Response, error) {
+	tier := gateway.tiers[tierName]
+	provider := gateway.providers[tier.Provider]
 	inputUpperBound, err := gateway.counter.CountInputTokens(ctx, tier.Model, request.Prompt)
 	if err != nil {
 		return Response{}, fmt.Errorf("count input tokens: %w", err)
@@ -113,12 +120,8 @@ func (gateway Gateway) Call(ctx context.Context, request CallRequest) (Response,
 		return Response{}, fmt.Errorf("estimate reservation: %w", ErrInvalidCall)
 	}
 	reservation := budget.Reservation{
-		ID:             request.ID,
-		RunID:          request.RunID,
-		UnitID:         request.UnitID,
-		Tier:           request.Tier,
-		ReservedMicros: reservedMicros,
-		CreatedAt:      time.Now().UTC(),
+		ID: request.ID, RunID: request.RunID, UnitID: request.UnitID, Tier: tierName,
+		ReservedMicros: reservedMicros, CreatedAt: time.Now().UTC(),
 	}
 	if err := gateway.ledger.Reserve(ctx, reservation); err != nil {
 		return Response{}, err
@@ -149,7 +152,33 @@ func (gateway Gateway) Call(ctx context.Context, request CallRequest) (Response,
 	if err := gateway.ledger.Settle(ctx, request.ID, usage); err != nil {
 		return Response{}, fmt.Errorf("settle model call: %w", err)
 	}
+	response.Tier = tierName
 	return response, nil
+}
+
+func (gateway Gateway) validateTierOrder(order []string) error {
+	seen := make(map[string]struct{}, len(order))
+	for _, tierName := range order {
+		if tierName == "" {
+			return ErrInvalidCall
+		}
+		if _, exists := seen[tierName]; exists {
+			return fmt.Errorf("%w: duplicate tier %s", ErrInvalidCall, tierName)
+		}
+		seen[tierName] = struct{}{}
+		tier, ok := gateway.tiers[tierName]
+		if !ok {
+			return fmt.Errorf("%w: %s", ErrUnknownTier, tierName)
+		}
+		if err := validateTier(tier); err != nil {
+			return err
+		}
+		provider, ok := gateway.providers[tier.Provider]
+		if !ok || provider == nil {
+			return fmt.Errorf("%w: %s", ErrUnknownProvider, tier.Provider)
+		}
+	}
+	return nil
 }
 
 func validateTier(tier Tier) error {

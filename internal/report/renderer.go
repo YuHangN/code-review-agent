@@ -42,10 +42,21 @@ func Render(input Input) (string, error) {
 	fmt.Fprintf(&output, "- 高置信度：%d\n", len(confirmed))
 	fmt.Fprintf(&output, "- 仅供参考：%d\n", len(advisory))
 	fmt.Fprintf(&output, "- 预算使用：%s / %s\n", formatUSD(input.Budget.CommittedMicros), formatUSD(input.Run.BudgetLimitMicros))
+	if len(input.Budget.Tiers) > 0 {
+		fmt.Fprintf(&output, "- 模型 Tier：%s\n", formatTierUsage(input.Budget.Tiers))
+	}
 
 	renderFindingSection(&output, "高置信度，可直接采纳", confirmed)
 	renderFindingSection(&output, "仅供参考", advisory)
 	return output.String(), nil
+}
+
+func formatTierUsage(tiers []budget.TierSummary) string {
+	items := make([]string, 0, len(tiers))
+	for _, tier := range tiers {
+		items = append(items, fmt.Sprintf("%s %d 次（%s）", singleLine(tier.Name), tier.SettledCalls, formatUSD(tier.ActualMicros)))
+	}
+	return strings.Join(items, "，")
 }
 
 func splitAndSortFindings(findings []domain.VerifiedFinding) ([]domain.VerifiedFinding, []domain.VerifiedFinding) {

@@ -1057,6 +1057,26 @@ func (s *Store) BudgetSummary(ctx context.Context, runID string) (budget.Summary
 	if err != nil {
 		return budget.Summary{}, fmt.Errorf("summarize budget: %w", err)
 	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT tier, COUNT(*), COALESCE(SUM(actual_micros), 0)
+		FROM budget_ledger
+		WHERE run_id = ? AND status = ?
+		GROUP BY tier
+		ORDER BY tier`, runID, budget.StatusSettled)
+	if err != nil {
+		return budget.Summary{}, fmt.Errorf("summarize budget tiers: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var tier budget.TierSummary
+		if err := rows.Scan(&tier.Name, &tier.SettledCalls, &tier.ActualMicros); err != nil {
+			return budget.Summary{}, fmt.Errorf("scan budget tier summary: %w", err)
+		}
+		summary.Tiers = append(summary.Tiers, tier)
+	}
+	if err := rows.Err(); err != nil {
+		return budget.Summary{}, fmt.Errorf("iterate budget tier summary: %w", err)
+	}
 	return summary, nil
 }
 

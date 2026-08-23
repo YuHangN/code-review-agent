@@ -56,6 +56,73 @@ func TestGatewayDoesNotCallProviderWhenBudgetCannotBeReserved(t *testing.T) {
 	}
 }
 
+func TestGatewayFallsBackWhenPreferredTierCannotReserveBudget(t *testing.T) {
+	manager := newBudgetManager(t, 60)
+	strong := &llm.FakeProvider{}
+	economy := &llm.FakeProvider{Response: llm.Response{
+		Content: `{"findings":[]}`,
+		Usage:   &llm.TokenUsage{InputTokens: 5, OutputTokens: 1},
+	}}
+	gateway := llm.NewGateway(manager, fixedCounter(5), map[string]llm.Provider{
+		"strong-provider":  strong,
+		"economy-provider": economy,
+	}, fallbackTiers())
+	request := callRequest("call-1")
+	request.TierOrder = []string{"strong", "economy"}
+
+	response, err := gateway.Call(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Tier != "economy" {
+		t.Fatalf("selected tier = %q, want economy", response.Tier)
+	}
+	if len(strong.Requests()) != 0 || len(economy.Requests()) != 1 {
+		t.Fatalf("provider calls: strong=%d economy=%d", len(strong.Requests()), len(economy.Requests()))
+	}
+}
+
+func TestGatewayReturnsLimitWhenNoFallbackTierFitsBudget(t *testing.T) {
+	manager := newBudgetManager(t, 40)
+	strong := &llm.FakeProvider{}
+	economy := &llm.FakeProvider{}
+	gateway := llm.NewGateway(manager, fixedCounter(5), map[string]llm.Provider{
+		"strong-provider":  strong,
+		"economy-provider": economy,
+	}, fallbackTiers())
+	request := callRequest("call-1")
+	request.TierOrder = []string{"strong", "economy"}
+
+	_, err := gateway.Call(context.Background(), request)
+	if !errors.Is(err, budget.ErrLimitExceeded) {
+		t.Fatalf("Call error = %v, want ErrLimitExceeded", err)
+	}
+	if len(strong.Requests()) != 0 || len(economy.Requests()) != 0 {
+		t.Fatalf("provider was called: strong=%d economy=%d", len(strong.Requests()), len(economy.Requests()))
+	}
+}
+
+func TestGatewayDoesNotFallbackOnProviderFailure(t *testing.T) {
+	manager := newBudgetManager(t, 200)
+	providerErr := errors.New("provider unavailable")
+	strong := &llm.FakeProvider{Err: providerErr}
+	economy := &llm.FakeProvider{}
+	gateway := llm.NewGateway(manager, fixedCounter(5), map[string]llm.Provider{
+		"strong-provider":  strong,
+		"economy-provider": economy,
+	}, fallbackTiers())
+	request := callRequest("call-1")
+	request.TierOrder = []string{"strong", "economy"}
+
+	_, err := gateway.Call(context.Background(), request)
+	if !errors.Is(err, providerErr) {
+		t.Fatalf("Call error = %v, want provider error", err)
+	}
+	if len(strong.Requests()) != 1 || len(economy.Requests()) != 0 {
+		t.Fatalf("provider calls: strong=%d economy=%d", len(strong.Requests()), len(economy.Requests()))
+	}
+}
+
 func TestGatewayReleasesReservationWhenProviderFails(t *testing.T) {
 	manager := newBudgetManager(t, 100)
 	provider := &llm.FakeProvider{Err: errors.New("temporary provider failure")}
@@ -103,8 +170,27 @@ func testTiers() map[string]llm.Tier {
 	}
 }
 
+func fallbackTiers() map[string]llm.Tier {
+	return map[string]llm.Tier{
+		"strong": {
+			Provider:                    "strong-provider",
+			Model:                       "strong-reviewer",
+			InputPriceMicrosPerMillion:  4_000_000,
+			OutputPriceMicrosPerMillion: 8_000_000,
+			MaxOutputTokens:             10,
+		},
+		"economy": {
+			Provider:                    "economy-provider",
+			Model:                       "economy-reviewer",
+			InputPriceMicrosPerMillion:  2_000_000,
+			OutputPriceMicrosPerMillion: 4_000_000,
+			MaxOutputTokens:             10,
+		},
+	}
+}
+
 func callRequest(id string) llm.CallRequest {
-	return llm.CallRequest{ID: id, RunID: "run-001", UnitID: "unit-001", Tier: "economy", Prompt: "review this diff"}
+	return llm.CallRequest{ID: id, RunID: "run-001", UnitID: "unit-001", TierOrder: []string{"economy"}, Prompt: "review this diff"}
 }
 
 type fixedCounter int64
