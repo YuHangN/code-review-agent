@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -427,6 +428,183 @@ func (s *Store) CompleteReviewUnit(ctx context.Context, trace domain.ReviewTrace
 	return nil
 }
 
+// EnsureCheckerRuns 为本次 Run 创建稳定的 Checker checkpoint，重复调用不会覆盖已有结果。
+func (s *Store) EnsureCheckerRuns(ctx context.Context, runID string, checkers []string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin ensure checker runs: %w", err)
+	}
+	defer tx.Rollback()
+	var status domain.RunStatus
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM runs WHERE id = ?`, runID).Scan(&status); err != nil {
+		return fmt.Errorf("read checker run status: %w", err)
+	}
+	if status != domain.RunStatusChecking {
+		return fmt.Errorf("run is not checking")
+	}
+	for _, checker := range checkers {
+		checker = strings.TrimSpace(checker)
+		if checker == "" {
+			return fmt.Errorf("invalid checker name")
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO checker_runs (id, run_id, checker, status, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(run_id, checker) DO NOTHING`,
+			checkerRunID(runID, checker), runID, checker, domain.CheckerStatusPending, timeText(now), timeText(now)); err != nil {
+			return fmt.Errorf("insert checker run: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit checker runs: %w", err)
+	}
+	return nil
+}
+
+// ClaimCheckerRun 在当前 Run lease 持有者名下领取一个尚未完成的 Checker。
+func (s *Store) ClaimCheckerRun(ctx context.Context, runID, checker, owner string, now time.Time) (domain.CheckerRun, error) {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checker_runs SET status = ?, attempt = attempt + 1, updated_at = ?
+		WHERE run_id = ? AND checker = ? AND status IN (?, ?, ?)
+		  AND EXISTS (SELECT 1 FROM runs WHERE id = checker_runs.run_id AND status = ? AND lease_owner = ? AND lease_expires_at > ?)`,
+		domain.CheckerStatusRunning, timeText(now), runID, checker,
+		domain.CheckerStatusPending, domain.CheckerStatusFailedRecoverable, domain.CheckerStatusRunning,
+		domain.RunStatusChecking, owner, timeText(now))
+	if err != nil {
+		return domain.CheckerRun{}, fmt.Errorf("claim checker run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return domain.CheckerRun{}, ErrLeaseHeld
+	}
+	return s.getCheckerRun(ctx, runID, checker)
+}
+
+// CompleteCheckerRun 原子保存工具输出、finding 级 Trace、诊断和 completed checkpoint。
+func (s *Store) CompleteCheckerRun(ctx context.Context, run domain.CheckerRun, diagnostics []domain.CheckerDiagnostic, traces []domain.ReviewTrace, owner string, now time.Time) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin complete checker run: %w", err)
+	}
+	defer tx.Rollback()
+	if len(diagnostics) != len(traces) {
+		return fmt.Errorf("checker diagnostics and traces do not match")
+	}
+	traceByID := make(map[string]domain.ReviewTrace, len(traces))
+	for _, trace := range traces {
+		if trace.RunID != run.RunID || trace.Detector != "checker:"+run.Checker {
+			return fmt.Errorf("invalid checker trace %q", trace.ID)
+		}
+		if err := insertReviewTrace(ctx, tx, trace); err != nil {
+			return err
+		}
+		traceByID[trace.ID] = trace
+	}
+	for _, diagnostic := range diagnostics {
+		trace, ok := traceByID[diagnostic.TraceID]
+		if !ok || diagnostic.RunID != run.RunID || diagnostic.CheckerRunID != run.ID || diagnostic.Checker != run.Checker || diagnostic.UnitID != trace.UnitID {
+			return fmt.Errorf("invalid checker diagnostic %q", diagnostic.ID)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO checker_diagnostics (
+				id, run_id, checker_run_id, unit_id, trace_id, checker, file_path,
+				line, column_number, diagnostic_code, message, severity, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			diagnostic.ID, diagnostic.RunID, diagnostic.CheckerRunID, diagnostic.UnitID,
+			diagnostic.TraceID, diagnostic.Checker, diagnostic.File, diagnostic.Line,
+			diagnostic.Column, diagnostic.Code, diagnostic.Message, diagnostic.Severity,
+			timeText(diagnostic.CreatedAt)); err != nil {
+			return fmt.Errorf("insert checker diagnostic: %w", err)
+		}
+	}
+	commandJSON, err := json.Marshal(run.Command)
+	if err != nil {
+		return fmt.Errorf("marshal checker command: %w", err)
+	}
+	result, err := tx.ExecContext(ctx, `
+		UPDATE checker_runs SET status = ?, command_json = ?, exit_code = ?, output = ?, error_message = '', updated_at = ?
+		WHERE id = ? AND status = ?
+		  AND EXISTS (SELECT 1 FROM runs WHERE id = checker_runs.run_id AND status = ? AND lease_owner = ? AND lease_expires_at > ?)`,
+		domain.CheckerStatusCompleted, string(commandJSON), run.ExitCode, run.Output, timeText(now), run.ID,
+		domain.CheckerStatusRunning, domain.RunStatusChecking, owner, timeText(now))
+	if err != nil {
+		return fmt.Errorf("complete checker run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return ErrLeaseHeld
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit checker run: %w", err)
+	}
+	return nil
+}
+
+// FailCheckerRun 保存可恢复错误；resume 会重新领取这个 Checker。
+func (s *Store) FailCheckerRun(ctx context.Context, run domain.CheckerRun, message, owner string, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE checker_runs SET status = ?, error_message = ?, updated_at = ?
+		WHERE id = ? AND status = ?
+		  AND EXISTS (SELECT 1 FROM runs WHERE id = checker_runs.run_id AND status = ? AND lease_owner = ?)`,
+		domain.CheckerStatusFailedRecoverable, message, timeText(now), run.ID, domain.CheckerStatusRunning, domain.RunStatusChecking, owner)
+	if err != nil {
+		return fmt.Errorf("fail checker run: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return ErrLeaseHeld
+	}
+	return nil
+}
+
+// ListCheckerRuns 返回稳定顺序的 Checker checkpoint。
+func (s *Store) ListCheckerRuns(ctx context.Context, runID string) ([]domain.CheckerRun, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, checker, status, attempt, command_json, exit_code, output, error_message, created_at, updated_at
+		FROM checker_runs WHERE run_id = ? ORDER BY checker`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list checker runs: %w", err)
+	}
+	defer rows.Close()
+	var result []domain.CheckerRun
+	for rows.Next() {
+		checkerRun, err := scanCheckerRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, checkerRun)
+	}
+	return result, rows.Err()
+}
+
+// ListCheckerDiagnostics 返回可以在聚合阶段转换为最终 Finding 的确定性诊断。
+func (s *Store) ListCheckerDiagnostics(ctx context.Context, runID string) ([]domain.CheckerDiagnostic, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, run_id, checker_run_id, unit_id, trace_id, checker, file_path,
+		       line, column_number, diagnostic_code, message, severity, created_at
+		FROM checker_diagnostics WHERE run_id = ? ORDER BY file_path, line, checker, id`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list checker diagnostics: %w", err)
+	}
+	defer rows.Close()
+	var result []domain.CheckerDiagnostic
+	for rows.Next() {
+		var diagnostic domain.CheckerDiagnostic
+		var createdAt string
+		if err := rows.Scan(&diagnostic.ID, &diagnostic.RunID, &diagnostic.CheckerRunID, &diagnostic.UnitID,
+			&diagnostic.TraceID, &diagnostic.Checker, &diagnostic.File, &diagnostic.Line, &diagnostic.Column,
+			&diagnostic.Code, &diagnostic.Message, &diagnostic.Severity, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan checker diagnostic: %w", err)
+		}
+		diagnostic.CreatedAt, err = parseTime(createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse checker diagnostic created_at: %w", err)
+		}
+		result = append(result, diagnostic)
+	}
+	return result, rows.Err()
+}
+
 // FinishReviewUnit 保存无 finding 的失败或预算跳过 trace，并推进 Unit 状态。
 func (s *Store) FinishReviewUnit(ctx context.Context, trace domain.ReviewTrace, status domain.UnitStatus, owner string, now time.Time) error {
 	if status != domain.UnitStatusFailedRecoverable && status != domain.UnitStatusSkippedBudget {
@@ -458,6 +636,47 @@ func (s *Store) FinishReviewUnit(ctx context.Context, trace domain.ReviewTrace, 
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit finish review unit: %w", err)
+	}
+	return nil
+}
+
+// AdvanceRunToChecking 在当前 lease 仍有效且所有 Unit 都是终态时进入仓库级检查阶段。
+func (s *Store) AdvanceRunToChecking(ctx context.Context, runID, owner string, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = ? AND status IN (?, ?) AND lease_owner = ? AND lease_expires_at > ?
+		  AND NOT EXISTS (SELECT 1 FROM review_units WHERE run_id = runs.id AND status NOT IN (?, ?))`,
+		domain.RunStatusChecking, timeText(now), runID, domain.RunStatusPlanned, domain.RunStatusReviewing,
+		owner, timeText(now), domain.UnitStatusCompleted, domain.UnitStatusSkippedBudget)
+	if err != nil {
+		return fmt.Errorf("advance run to checking: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read checking result: %w", err)
+	}
+	if changed != 1 {
+		return ErrRunNotReady
+	}
+	return nil
+}
+
+// AdvanceCheckingToAggregating 只在全部 Checker 完成且 lease 仍属于当前进程时推进。
+func (s *Store) AdvanceCheckingToAggregating(ctx context.Context, runID, owner string, now time.Time) error {
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET status = ?, updated_at = ?
+		WHERE id = ? AND status = ? AND lease_owner = ? AND lease_expires_at > ?
+		  AND NOT EXISTS (SELECT 1 FROM checker_runs WHERE run_id = runs.id AND status != ?)`,
+		domain.RunStatusAggregating, timeText(now), runID, domain.RunStatusChecking, owner, timeText(now), domain.CheckerStatusCompleted)
+	if err != nil {
+		return fmt.Errorf("advance checking to aggregating: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read aggregating result: %w", err)
+	}
+	if changed != 1 {
+		return ErrRunNotReady
 	}
 	return nil
 }
@@ -738,6 +957,9 @@ func (s *Store) ReplaceVerifiedFindings(ctx context.Context, runID string, findi
 		if finding.RunID != runID {
 			return fmt.Errorf("verified finding %q belongs to another run", finding.ID)
 		}
+		if finding.CandidateID == "" && (finding.Confidence != domain.ConfidenceConfirmed || !strings.HasPrefix(finding.VerificationSource, "checker:")) {
+			return fmt.Errorf("verified finding %q is missing candidate", finding.ID)
+		}
 		evidenceJSON, err := json.Marshal(finding.Evidence)
 		if err != nil {
 			return fmt.Errorf("marshal verified evidence: %w", err)
@@ -748,7 +970,7 @@ func (s *Store) ReplaceVerifiedFindings(ctx context.Context, runID string, findi
 				verification_source, verification_reason, category, severity, file_path,
 				line, title, explanation, evidence_json, suggestion, created_at
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			finding.ID, finding.RunID, finding.CandidateID, finding.TraceID, finding.Fingerprint,
+			finding.ID, finding.RunID, nullableString(finding.CandidateID), finding.TraceID, finding.Fingerprint,
 			finding.Confidence, finding.VerificationSource, finding.VerificationReason,
 			finding.Category, finding.Severity, finding.File, finding.Line, finding.Title,
 			finding.Explanation, string(evidenceJSON), finding.Suggestion, timeText(finding.CreatedAt),
@@ -776,15 +998,19 @@ func (s *Store) ListVerifiedFindings(ctx context.Context, runID string) ([]domai
 	var findings []domain.VerifiedFinding
 	for rows.Next() {
 		var finding domain.VerifiedFinding
+		var candidateID sql.NullString
 		var evidenceJSON, createdAt string
 		if err := rows.Scan(
-			&finding.ID, &finding.RunID, &finding.CandidateID, &finding.TraceID,
+			&finding.ID, &finding.RunID, &candidateID, &finding.TraceID,
 			&finding.Fingerprint, &finding.Confidence, &finding.VerificationSource,
 			&finding.VerificationReason, &finding.Category, &finding.Severity,
 			&finding.File, &finding.Line, &finding.Title, &finding.Explanation,
 			&evidenceJSON, &finding.Suggestion, &createdAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan verified finding: %w", err)
+		}
+		if candidateID.Valid {
+			finding.CandidateID = candidateID.String
 		}
 		if err := json.Unmarshal([]byte(evidenceJSON), &finding.Evidence); err != nil {
 			return nil, fmt.Errorf("parse verified evidence: %w", err)
@@ -1162,6 +1388,40 @@ func nullableString(value string) any {
 		return nil
 	}
 	return value
+}
+
+func (s *Store) getCheckerRun(ctx context.Context, runID, checker string) (domain.CheckerRun, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, run_id, checker, status, attempt, command_json, exit_code, output, error_message, created_at, updated_at
+		FROM checker_runs WHERE run_id = ? AND checker = ?`, runID, checker)
+	return scanCheckerRun(row)
+}
+
+func scanCheckerRun(row rowScanner) (domain.CheckerRun, error) {
+	var result domain.CheckerRun
+	var commandJSON, createdAt, updatedAt string
+	if err := row.Scan(&result.ID, &result.RunID, &result.Checker, &result.Status, &result.Attempt,
+		&commandJSON, &result.ExitCode, &result.Output, &result.ErrorMessage, &createdAt, &updatedAt); err != nil {
+		return domain.CheckerRun{}, fmt.Errorf("scan checker run: %w", err)
+	}
+	if err := json.Unmarshal([]byte(commandJSON), &result.Command); err != nil {
+		return domain.CheckerRun{}, fmt.Errorf("parse checker command: %w", err)
+	}
+	var err error
+	result.CreatedAt, err = parseTime(createdAt)
+	if err != nil {
+		return domain.CheckerRun{}, fmt.Errorf("parse checker created_at: %w", err)
+	}
+	result.UpdatedAt, err = parseTime(updatedAt)
+	if err != nil {
+		return domain.CheckerRun{}, fmt.Errorf("parse checker updated_at: %w", err)
+	}
+	return result, nil
+}
+
+func checkerRunID(runID, checker string) string {
+	hash := sha256.Sum256([]byte(runID + "\x00" + checker))
+	return fmt.Sprintf("checker-%x", hash[:8])
 }
 
 func nullableTime(value time.Time) any {

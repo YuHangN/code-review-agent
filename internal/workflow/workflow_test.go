@@ -25,9 +25,10 @@ func TestWorkflowContinuesPlannedRunThroughReport(t *testing.T) {
 		{ID: "low", UnitKey: "a", Risk: "low", Status: domain.UnitStatusPending},
 	})
 	processor := &workflowProcessor{events: &store.events}
+	checker := &workflowChecker{events: &store.events}
 	aggregator := &workflowAggregator{events: &store.events}
 	reporter := &workflowReporter{store: store, events: &store.events}
-	flow := workflow.New(store, processor, aggregator, reporter)
+	flow := workflow.NewWithChecker(store, processor, checker, aggregator, reporter)
 
 	result, err := flow.Execute(context.Background(), executeRequest())
 	if err != nil {
@@ -35,7 +36,7 @@ func TestWorkflowContinuesPlannedRunThroughReport(t *testing.T) {
 	}
 	wantEvents := []string{
 		"claim", "process:high-a", "process:high-b", "process:medium", "process:low",
-		"aggregating", "release", "aggregate", "report",
+		"checking", "release", "claim", "check", "aggregating", "release", "aggregate", "report",
 	}
 	if !reflect.DeepEqual(store.events, wantEvents) {
 		t.Fatalf("events = %v, want %v", store.events, wantEvents)
@@ -182,6 +183,8 @@ type workflowStore struct {
 	renewed  chan struct{}
 	renew    sync.Once
 	renewErr error
+	leaseMu  sync.Mutex
+	active   bool
 }
 
 func newWorkflowStore(status domain.RunStatus, units []domain.ReviewUnit) *workflowStore {
@@ -193,12 +196,18 @@ func (store *workflowStore) GetRun(context.Context, string) (domain.Run, error) 
 }
 
 func (store *workflowStore) ClaimRun(_ context.Context, _ string, _ string, _ time.Time, _ time.Duration) (domain.Run, error) {
-	if store.claims.Add(1) > 1 {
+	store.claims.Add(1)
+	store.leaseMu.Lock()
+	defer store.leaseMu.Unlock()
+	if store.active {
 		store.renew.Do(func() { close(store.renewed) })
 		return store.run, store.renewErr
 	}
+	store.active = true
 	store.events = append(store.events, "claim")
-	store.run.Status = domain.RunStatusReviewing
+	if store.run.Status != domain.RunStatusChecking {
+		store.run.Status = domain.RunStatusReviewing
+	}
 	return store.run, nil
 }
 
@@ -206,13 +215,22 @@ func (store *workflowStore) ListUnits(context.Context, string) ([]domain.ReviewU
 	return append([]domain.ReviewUnit(nil), store.units...), store.listErr
 }
 
-func (store *workflowStore) AdvanceRunToAggregating(context.Context, string, string, time.Time) error {
+func (store *workflowStore) AdvanceRunToChecking(context.Context, string, string, time.Time) error {
+	store.events = append(store.events, "checking")
+	store.run.Status = domain.RunStatusChecking
+	return nil
+}
+
+func (store *workflowStore) AdvanceCheckingToAggregating(context.Context, string, string, time.Time) error {
 	store.events = append(store.events, "aggregating")
 	store.run.Status = domain.RunStatusAggregating
 	return nil
 }
 
 func (store *workflowStore) ReleaseRunLease(context.Context, string, string) error {
+	store.leaseMu.Lock()
+	store.active = false
+	store.leaseMu.Unlock()
 	store.events = append(store.events, "release")
 	return nil
 }
@@ -238,6 +256,13 @@ func (processor *workflowProcessor) Process(_ context.Context, unitID string, _ 
 
 type workflowAggregator struct {
 	events *[]string
+}
+
+type workflowChecker struct{ events *[]string }
+
+func (checker *workflowChecker) Process(context.Context, string, string, time.Time) error {
+	*checker.events = append(*checker.events, "check")
+	return nil
 }
 
 func (aggregator *workflowAggregator) Aggregate(context.Context, string, time.Time) (verifier.AggregatorResult, error) {

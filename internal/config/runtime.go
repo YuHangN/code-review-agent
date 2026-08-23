@@ -23,6 +23,19 @@ type Runtime struct {
 	DefaultLLMTier     string
 	LLMFallbackOrder   []string
 	LLMTiers           map[string]llm.Tier
+	Checkers           CheckerConfig
+}
+
+type CheckerDefinition struct {
+	Name, Implementation string
+	Timeout              time.Duration
+}
+type CheckerConfig struct {
+	Enabled                                           bool
+	DockerBinary, Image, CPUs, Memory, TmpSize, Proxy string
+	PIDs                                              int
+	DependencyTimeout                                 time.Duration
+	Definitions                                       []CheckerDefinition
 }
 
 type rawLLMTier struct {
@@ -57,6 +70,22 @@ func LoadRuntime(path string) (Runtime, error) {
 			FallbackOrder  []string              `yaml:"fallback_order"`
 			Tiers          map[string]rawLLMTier `yaml:"tiers"`
 		} `yaml:"llm"`
+		Checkers struct {
+			Enabled           bool   `yaml:"enabled"`
+			DockerBinary      string `yaml:"docker_binary"`
+			Image             string `yaml:"image"`
+			CPUs              string `yaml:"cpus"`
+			Memory            string `yaml:"memory"`
+			TmpSize           string `yaml:"tmp_size"`
+			PIDs              int    `yaml:"pids"`
+			DependencyTimeout string `yaml:"dependency_timeout"`
+			Proxy             string `yaml:"proxy"`
+			Definitions       []struct {
+				Name           string `yaml:"name"`
+				Implementation string `yaml:"implementation"`
+				Timeout        string `yaml:"timeout"`
+			} `yaml:"definitions"`
+		} `yaml:"checkers"`
 	}
 	if err := yaml.Unmarshal(content, &raw); err != nil {
 		return Runtime{}, fmt.Errorf("parse runtime config: %w", err)
@@ -75,6 +104,20 @@ func LoadRuntime(path string) (Runtime, error) {
 	runtime, err := parseRuntime(raw.Runtime.LeaseTTL, raw.Runtime.LeaseRenewInterval, raw.Runtime.SQLiteBusyTimeout, raw.Review.DefaultBudgetCents, raw.Review.Currency, raw.Review.MaxFindingsPerUnit, raw.LLM.RequestTimeout, raw.LLM.DefaultTier, raw.LLM.FallbackOrder, tiers)
 	if err != nil {
 		return Runtime{}, fmt.Errorf("validate runtime config: %w", err)
+	}
+	if raw.Checkers.Enabled {
+		dependencyTimeout, parseErr := time.ParseDuration(raw.Checkers.DependencyTimeout)
+		if parseErr != nil || dependencyTimeout <= 0 || raw.Checkers.DockerBinary == "" || raw.Checkers.Image == "" || raw.Checkers.CPUs == "" || raw.Checkers.Memory == "" || raw.Checkers.TmpSize == "" || raw.Checkers.PIDs <= 0 || !strings.HasPrefix(raw.Checkers.Proxy, "https://") || len(raw.Checkers.Definitions) == 0 {
+			return Runtime{}, fmt.Errorf("validate checker config")
+		}
+		runtime.Checkers = CheckerConfig{Enabled: true, DockerBinary: raw.Checkers.DockerBinary, Image: raw.Checkers.Image, CPUs: raw.Checkers.CPUs, Memory: raw.Checkers.Memory, TmpSize: raw.Checkers.TmpSize, PIDs: raw.Checkers.PIDs, DependencyTimeout: dependencyTimeout, Proxy: raw.Checkers.Proxy}
+		for _, definition := range raw.Checkers.Definitions {
+			timeout, parseErr := time.ParseDuration(definition.Timeout)
+			if parseErr != nil || timeout <= 0 || definition.Name == "" || (definition.Implementation != "go_vet" && definition.Implementation != "staticcheck") {
+				return Runtime{}, fmt.Errorf("validate checker definition")
+			}
+			runtime.Checkers.Definitions = append(runtime.Checkers.Definitions, CheckerDefinition{Name: definition.Name, Implementation: definition.Implementation, Timeout: timeout})
+		}
 	}
 	return runtime, nil
 }

@@ -18,6 +18,7 @@ type Input struct {
 	Run      domain.Run
 	Snapshot domain.ChangeSnapshot
 	Units    []domain.ReviewUnit
+	Checkers []domain.CheckerRun
 	Findings []domain.VerifiedFinding
 	Budget   budget.Summary
 }
@@ -45,10 +46,23 @@ func Render(input Input) (string, error) {
 	if len(input.Budget.Tiers) > 0 {
 		fmt.Fprintf(&output, "- 模型 Tier：%s\n", formatTierUsage(input.Budget.Tiers))
 	}
+	if len(input.Checkers) > 0 {
+		fmt.Fprintf(&output, "- Checker：%s\n", formatCheckers(input.Checkers))
+	}
 
 	renderFindingSection(&output, "高置信度，可直接采纳", confirmed)
 	renderFindingSection(&output, "仅供参考", advisory)
 	return output.String(), nil
+}
+
+func formatCheckers(checkers []domain.CheckerRun) string {
+	items := append([]domain.CheckerRun(nil), checkers...)
+	sort.Slice(items, func(i, j int) bool { return items[i].Checker < items[j].Checker })
+	formatted := make([]string, 0, len(items))
+	for _, checker := range items {
+		formatted = append(formatted, fmt.Sprintf("%s=%s（%d 次）", singleLine(checker.Checker), checker.Status, checker.Attempt))
+	}
+	return strings.Join(formatted, "，")
 }
 
 func formatTierUsage(tiers []budget.TierSummary) string {

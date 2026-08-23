@@ -1,6 +1,7 @@
 package scm
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -18,8 +19,9 @@ import (
 const githubAPIVersion = "2026-03-10"
 
 const (
-	maxGitHubResponseBytes = int64(32 << 20)
-	maxRepositoryFileBytes = int64(1 << 20)
+	maxGitHubResponseBytes    = int64(32 << 20)
+	maxRepositoryFileBytes    = int64(1 << 20)
+	maxRepositoryArchiveBytes = int64(512 << 20)
 )
 
 // GitHubAdapter 通过 GitHub REST API 拉取固定 SHA 的 PR 变更。
@@ -113,6 +115,19 @@ func (a *GitHubAdapter) ReadFile(ctx context.Context, ref ChangeRef, sha, filePa
 		url.Values{"ref": []string{sha}},
 		maxRepositoryFileBytes,
 	)
+}
+
+// OpenArchive 下载固定 commit SHA 的 GitHub tarball，不跟随可变分支。
+func (a *GitHubAdapter) OpenArchive(ctx context.Context, ref ChangeRef, sha string) (io.ReadCloser, error) {
+	owner, repository, err := githubRepository(ref)
+	if err != nil || strings.TrimSpace(sha) == "" {
+		return nil, fmt.Errorf("invalid repository archive reference")
+	}
+	content, err := a.getWithQueryLimit(ctx, fmt.Sprintf("/repos/%s/%s/tarball/%s", url.PathEscape(owner), url.PathEscape(repository), url.PathEscape(sha)), "application/vnd.github+json", nil, maxRepositoryArchiveBytes)
+	if err != nil {
+		return nil, fmt.Errorf("get repository archive: %w", err)
+	}
+	return io.NopCloser(bytes.NewReader(content)), nil
 }
 
 func githubRepository(ref ChangeRef) (string, string, error) {

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -53,6 +54,21 @@ func TestGitHubAdapterReadsFileAtExplicitCommitSHA(t *testing.T) {
 	if string(content) != "package auth\n" {
 		t.Fatalf("content = %q", content)
 	}
+}
+
+func TestGitHubAdapterOpensArchiveAtExplicitCommitSHA(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/repos/acme/payments/tarball/head-sha" { t.Fatalf("path = %q", request.URL.Path) }
+		fmt.Fprint(writer, "archive-bytes")
+	}))
+	defer server.Close()
+	adapter, err := scm.NewGitHubAdapter(server.Client(), server.URL, "test-token")
+	if err != nil { t.Fatal(err) }
+	archive, err := adapter.OpenArchive(context.Background(), scm.ChangeRef{Provider: "github", Repository: "acme/payments", Number: 42}, "head-sha")
+	if err != nil { t.Fatal(err) }
+	defer archive.Close()
+	content, err := io.ReadAll(archive)
+	if err != nil || string(content) != "archive-bytes" { t.Fatalf("content=%q err=%v", content, err) }
 }
 
 func TestGitHubAdapterRejectsUnsafeFilePathWithoutRequest(t *testing.T) {

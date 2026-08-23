@@ -17,6 +17,7 @@ func TestRenderProducesDeterministicReviewReport(t *testing.T) {
 			{ID: "unit-a", Status: domain.UnitStatusCompleted},
 			{ID: "unit-b", Status: domain.UnitStatusSkippedBudget},
 		},
+		Checkers: []domain.CheckerRun{{Checker: "go_vet", Status: domain.CheckerStatusCompleted, Attempt: 1}, {Checker: "staticcheck", Status: domain.CheckerStatusCompleted, Attempt: 1}},
 		Budget: budget.Summary{
 			ActualMicros: 420_000, CommittedMicros: 420_000,
 			Tiers: []budget.TierSummary{
@@ -49,6 +50,7 @@ func TestRenderProducesDeterministicReviewReport(t *testing.T) {
 		"预算跳过 Unit：1",
 		"$0.420000 / $10.000000",
 		"模型 Tier：economy 3 次（$0.120000），strong 2 次（$0.300000）",
+		"Checker：go_vet=completed（1 次），staticcheck=completed（1 次）",
 		"## 高置信度，可直接采纳（1）",
 		"config.yaml:2",
 		"rule:redacted_secret_assignment",

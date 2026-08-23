@@ -27,19 +27,19 @@ type RuleResult struct {
 	Evidence string
 }
 
-// Rule 是可扩展的确定性验证规则；新规则不需要修改 Verifier 主流程。
-type Rule interface {
+// EvidenceRule 只复核 LLM Reviewer 的 Candidate，不主动发现或生成 Finding。
+type EvidenceRule interface {
 	Verify(candidate domain.CandidateFindingRecord, unit domain.ReviewUnit, steps []domain.AgentStep) RuleResult
 }
 
-// Verifier 按注册顺序执行规则，首个命中结果即可确认候选问题。
+// Verifier 按注册顺序复核 LLM Candidate，首个确定性证据命中即可确认候选问题。
 type Verifier struct {
-	rules []Rule
+	rules []EvidenceRule
 }
 
 // NewDefault 创建首版内置规则集合。
 func NewDefault() Verifier {
-	return Verifier{rules: []Rule{toolBackedSecretAssignmentRule{}, redactedSecretAssignmentRule{}}}
+	return Verifier{rules: []EvidenceRule{toolBackedSecretAssignmentRule{}, redactedSecretAssignmentRule{}}}
 }
 
 // Verify 根据确定性证据分类；未命中任何规则的候选只能是 advisory。
@@ -187,11 +187,15 @@ func addedLineAt(diff string, target int) (string, bool) {
 }
 
 func findingFingerprint(candidate domain.CandidateFindingRecord) string {
+	return findingFingerprintParts(candidate.Category, candidate.File, candidate.Line, candidate.Title)
+}
+
+func findingFingerprintParts(category, file string, line int, issueType string) string {
 	identity := strings.Join([]string{
-		strings.ToLower(strings.TrimSpace(candidate.File)),
-		strconv.Itoa(candidate.Line),
-		strings.ToLower(strings.TrimSpace(candidate.Category)),
-		normalize(candidate.Title),
+		strings.ToLower(strings.TrimSpace(file)),
+		strconv.Itoa(line),
+		strings.ToLower(strings.TrimSpace(category)),
+		normalize(issueType),
 	}, "\x00")
 	hash := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("%x", hash[:])

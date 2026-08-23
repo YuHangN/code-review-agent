@@ -5,10 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/YuHangN/code-review-agent/internal/domain"
 )
+
+// ArchiveAdapter 是需要固定 SHA 完整源码的仓库级检查器所依赖的可选能力。
+type ArchiveAdapter interface {
+	OpenArchive(ctx context.Context, ref ChangeRef, sha string) (io.ReadCloser, error)
+}
 
 var ErrUnsupportedURL = errors.New("unsupported SCM change URL")
 

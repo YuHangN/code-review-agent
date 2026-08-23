@@ -34,6 +34,20 @@ llm:
       input_price_micros_per_million_tokens: 2000000
       output_price_micros_per_million_tokens: 4000000
       max_output_tokens: 1200
+checkers:
+  enabled: true
+  docker_binary: docker
+  image: review-agent-checker:test
+  cpus: "1"
+  memory: 512m
+  tmp_size: 1g
+  pids: 128
+  dependency_timeout: 2m
+  proxy: https://proxy.golang.org
+  definitions:
+    - name: go_vet
+      implementation: go_vet
+      timeout: 1m
 `), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +87,9 @@ llm:
 	economy := runtime.LLMTiers["economy"]
 	if economy.Provider != "fake" || economy.Model != "fake-economy-reviewer" || economy.MaxOutputTokens != 1200 {
 		t.Fatalf("economy tier = %#v", economy)
+	}
+	if !runtime.Checkers.Enabled || runtime.Checkers.TmpSize != "1g" || len(runtime.Checkers.Definitions) != 1 || runtime.Checkers.Definitions[0].Name != "go_vet" {
+		t.Fatalf("checkers = %#v", runtime.Checkers)
 	}
 }
 

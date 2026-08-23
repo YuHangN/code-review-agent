@@ -77,6 +77,27 @@ func TestAggregatorUsesAgentToolEvidenceWhenVerifyingFinding(t *testing.T) {
 	}
 }
 
+func TestAggregatorIncludesConfirmedCheckerDiagnosticWithoutLLMCandidate(t *testing.T) {
+	now := time.Date(2026, 8, 23, 3, 0, 0, 0, time.UTC)
+	store := &checkerAggregatorStore{
+		aggregatorStore: aggregatorStore{},
+		diagnostics: []domain.CheckerDiagnostic{{
+			ID: "diagnostic-1", RunID: "run-001", TraceID: "trace-checker", Checker: "staticcheck",
+			File: "main.go", Line: 4, Column: 2, Code: "SA1006", Message: "invalid printf argument", Severity: "high", CreatedAt: now,
+		}},
+	}
+	result, err := verifier.NewAggregator(store, verifier.NewDefault()).Aggregate(context.Background(), "run-001", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Candidates != 0 || result.Findings != 1 || result.Confirmed != 1 || len(store.saved) != 1 {
+		t.Fatalf("result = %#v, findings = %#v", result, store.saved)
+	}
+	if store.saved[0].CandidateID != "" || store.saved[0].VerificationSource != "checker:staticcheck" || store.saved[0].TraceID != "trace-checker" {
+		t.Fatalf("checker finding = %#v", store.saved[0])
+	}
+}
+
 type aggregatorStore struct {
 	candidates []domain.CandidateFindingRecord
 	unit       domain.ReviewUnit
@@ -84,6 +105,15 @@ type aggregatorStore struct {
 	unitReads  int
 	stepReads  int
 	saved      []domain.VerifiedFinding
+}
+
+type checkerAggregatorStore struct {
+	aggregatorStore
+	diagnostics []domain.CheckerDiagnostic
+}
+
+func (store *checkerAggregatorStore) ListCheckerDiagnostics(context.Context, string) ([]domain.CheckerDiagnostic, error) {
+	return append([]domain.CheckerDiagnostic(nil), store.diagnostics...), nil
 }
 
 func (store *aggregatorStore) ListCandidateFindings(context.Context, string) ([]domain.CandidateFindingRecord, error) {

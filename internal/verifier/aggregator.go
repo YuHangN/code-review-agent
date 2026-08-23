@@ -20,6 +20,10 @@ type AggregatorStore interface {
 	ReplaceVerifiedFindings(ctx context.Context, runID string, findings []domain.VerifiedFinding) error
 }
 
+type checkerDiagnosticStore interface {
+	ListCheckerDiagnostics(ctx context.Context, runID string) ([]domain.CheckerDiagnostic, error)
+}
+
 // CandidateVerifier 允许 Aggregator 使用默认规则集或测试实现。
 type CandidateVerifier interface {
 	VerifyWithEvidence(candidate domain.CandidateFindingRecord, unit domain.ReviewUnit, steps []domain.AgentStep, now time.Time) domain.VerifiedFinding
@@ -58,6 +62,28 @@ func (aggregator Aggregator) Aggregate(ctx context.Context, runID string, now ti
 	units := make(map[string]domain.ReviewUnit)
 	stepsByUnit := make(map[string][]domain.AgentStep)
 	byFingerprint := make(map[string]domain.VerifiedFinding)
+	if checkerStore, ok := aggregator.store.(checkerDiagnosticStore); ok {
+		diagnostics, err := checkerStore.ListCheckerDiagnostics(ctx, runID)
+		if err != nil {
+			return AggregatorResult{}, fmt.Errorf("list checker diagnostics: %w", err)
+		}
+		for _, diagnostic := range diagnostics {
+			if diagnostic.RunID != runID {
+				return AggregatorResult{}, fmt.Errorf("checker diagnostic %q belongs to another run", diagnostic.ID)
+			}
+			fingerprint := findingFingerprintParts("correctness", diagnostic.File, diagnostic.Line, diagnostic.Checker+":"+diagnostic.Code)
+			finding := domain.VerifiedFinding{
+				ID: findingID(runID, fingerprint), RunID: runID, TraceID: diagnostic.TraceID, Fingerprint: fingerprint,
+				Confidence: domain.ConfidenceConfirmed, VerificationSource: "checker:" + diagnostic.Checker,
+				VerificationReason: "受限容器中的确定性静态检查器命中 PR 新增行",
+				Category:           "correctness", Severity: diagnostic.Severity, File: diagnostic.File, Line: diagnostic.Line,
+				Title: diagnostic.Code + " · " + diagnostic.Message, Explanation: diagnostic.Message,
+				Evidence:   []string{fmt.Sprintf("%s 在 %s:%d:%d 输出 %s", diagnostic.Checker, diagnostic.File, diagnostic.Line, diagnostic.Column, diagnostic.Code)},
+				Suggestion: "根据静态检查器诊断修复代码，并在本地重新运行对应检查。", CreatedAt: now,
+			}
+			byFingerprint[fingerprint] = finding
+		}
+	}
 	for _, candidate := range candidates {
 		if candidate.RunID != runID {
 			return AggregatorResult{}, fmt.Errorf("candidate %q belongs to another run", candidate.ID)

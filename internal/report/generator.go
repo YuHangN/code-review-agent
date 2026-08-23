@@ -30,6 +30,10 @@ type Store interface {
 	GetReport(ctx context.Context, runID string) (domain.Report, error)
 }
 
+type checkerStore interface {
+	ListCheckerRuns(context.Context, string) ([]domain.CheckerRun, error)
+}
+
 type Generator struct {
 	store Store
 }
@@ -82,7 +86,14 @@ func (generator Generator) Generate(ctx context.Context, request GenerateRequest
 	if err != nil {
 		return GenerateResult{}, fmt.Errorf("summarize report budget: %w", err)
 	}
-	content, err := Render(Input{Run: run, Snapshot: snapshot, Units: units, Findings: findings, Budget: budgetSummary})
+	var checkers []domain.CheckerRun
+	if store, ok := generator.store.(checkerStore); ok {
+		checkers, err = store.ListCheckerRuns(ctx, run.ID)
+		if err != nil {
+			return GenerateResult{}, fmt.Errorf("list report checkers: %w", err)
+		}
+	}
+	content, err := Render(Input{Run: run, Snapshot: snapshot, Units: units, Checkers: checkers, Findings: findings, Budget: budgetSummary})
 	if err != nil {
 		return GenerateResult{}, err
 	}

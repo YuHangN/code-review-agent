@@ -24,13 +24,19 @@ type StateStore interface {
 	GetRun(ctx context.Context, runID string) (domain.Run, error)
 	ClaimRun(ctx context.Context, runID, owner string, now time.Time, ttl time.Duration) (domain.Run, error)
 	ListUnits(ctx context.Context, runID string) ([]domain.ReviewUnit, error)
-	AdvanceRunToAggregating(ctx context.Context, runID, owner string, now time.Time) error
+	AdvanceRunToChecking(ctx context.Context, runID, owner string, now time.Time) error
+	AdvanceCheckingToAggregating(ctx context.Context, runID, owner string, now time.Time) error
 	ReleaseRunLease(ctx context.Context, runID, owner string) error
 }
 
 // UnitProcessor 处理一个 Review Unit，并负责保存它的 checkpoint。
 type UnitProcessor interface {
 	Process(ctx context.Context, unitID string, now time.Time) (review.UnitOutcome, error)
+}
+
+// CheckerProcessor 执行仓库级静态检查并保存独立 checkpoint。
+type CheckerProcessor interface {
+	Process(ctx context.Context, runID, owner string, now time.Time) error
 }
 
 // FindingAggregator 验证、去重并保存最终 Finding。
@@ -47,6 +53,7 @@ type ReportGenerator interface {
 type Workflow struct {
 	store      StateStore
 	processor  UnitProcessor
+	checker    CheckerProcessor
 	aggregator FindingAggregator
 	reporter   ReportGenerator
 }
@@ -75,7 +82,15 @@ type Result struct {
 }
 
 func New(store StateStore, processor UnitProcessor, aggregator FindingAggregator, reporter ReportGenerator) Workflow {
-	return Workflow{store: store, processor: processor, aggregator: aggregator, reporter: reporter}
+	return Workflow{store: store, processor: processor, checker: noOpChecker{}, aggregator: aggregator, reporter: reporter}
+}
+
+type noOpChecker struct{}
+
+func (noOpChecker) Process(context.Context, string, string, time.Time) error { return nil }
+
+func NewWithChecker(store StateStore, processor UnitProcessor, checker CheckerProcessor, aggregator FindingAggregator, reporter ReportGenerator) Workflow {
+	return Workflow{store: store, processor: processor, checker: checker, aggregator: aggregator, reporter: reporter}
 }
 
 // Execute 从数据库中的当前状态继续，不重做已经完成的阶段。
@@ -87,7 +102,7 @@ func (workflow Workflow) Execute(ctx context.Context, request ExecuteRequest) (R
 		return Result{}, err
 	}
 	result := Result{}
-	for transitions := 0; transitions < 3; transitions++ {
+	for transitions := 0; transitions < 5; transitions++ {
 		run, err := workflow.store.GetRun(ctx, request.RunID)
 		if err != nil {
 			return result, fmt.Errorf("get workflow run: %w", err)
@@ -97,6 +112,13 @@ func (workflow Workflow) Execute(ctx context.Context, request ExecuteRequest) (R
 			result.Units, err = workflow.processUnits(ctx, request)
 			if err != nil {
 				return result, fmt.Errorf("process review units: %w", err)
+			}
+		case domain.RunStatusChecking:
+			if workflow.checker == nil {
+				return result, fmt.Errorf("%w: checker stage is not configured", ErrWorkflowState)
+			}
+			if err = workflow.processCheckers(ctx, request); err != nil {
+				return result, fmt.Errorf("process checkers: %w", err)
 			}
 		case domain.RunStatusAggregating:
 			result.Aggregation, err = workflow.aggregator.Aggregate(ctx, request.RunID, time.Now().UTC())
@@ -174,10 +196,38 @@ func (workflow Workflow) processUnits(ctx context.Context, request ExecuteReques
 	if err := waitForLease(leaseErrors); err != nil {
 		return summary, err
 	}
-	if err := workflow.store.AdvanceRunToAggregating(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
-		return summary, fmt.Errorf("advance run to aggregating: %w", err)
+	if err := workflow.store.AdvanceRunToChecking(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
+		return summary, fmt.Errorf("advance run to checking: %w", err)
 	}
 	return summary, nil
+}
+
+func (workflow Workflow) processCheckers(ctx context.Context, request ExecuteRequest) (resultErr error) {
+	if _, err := workflow.store.ClaimRun(ctx, request.RunID, request.Owner, time.Now().UTC(), request.Lease.TTL); err != nil {
+		return fmt.Errorf("claim run: %w", err)
+	}
+	leaseCtx, stopLease := context.WithCancel(ctx)
+	leaseErrors := workflow.maintainLease(leaseCtx, request)
+	defer func() {
+		stopLease()
+		for leaseErr := range leaseErrors {
+			resultErr = errors.Join(resultErr, leaseErr)
+		}
+		if releaseErr := workflow.store.ReleaseRunLease(context.WithoutCancel(ctx), request.RunID, request.Owner); releaseErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("release run lease: %w", releaseErr))
+		}
+	}()
+	if err := workflow.checker.Process(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
+		return err
+	}
+	stopLease()
+	if err := waitForLease(leaseErrors); err != nil {
+		return err
+	}
+	if err := workflow.store.AdvanceCheckingToAggregating(ctx, request.RunID, request.Owner, time.Now().UTC()); err != nil {
+		return fmt.Errorf("advance checking to aggregating: %w", err)
+	}
+	return nil
 }
 
 func waitForLease(leaseErrors <-chan error) error {

@@ -24,6 +24,14 @@ review-agent trace <trace-id>
 
 真实 `run/resume` 从 `GITHUB_TOKEN` 和 `OPENAI_API_KEY` 环境变量读取凭据；凭据不会写入配置、SQLite、Trace 或报告。模型、价格和请求超时位于 `config/runtime.yaml`，Agent 上限和工具声明位于 `config/tools.yaml`。
 
+首次运行前构建固定的 Go Checker 镜像：
+
+```bash
+make checker-image
+```
+
+`go vet` 和 `staticcheck` 读取固定 `head_sha` 的完整仓库，但只有能够精确映射到 PR 新增行的诊断才会进入报告。
+
 `llm.fallback_order` 定义每轮模型调用的预算降级顺序。只有当前 Tier 无法预留预算时才尝试下一级；默认从 `gpt-5.4` 的 `strong` Tier 降到 `gpt-5.4-mini` 的 `economy` Tier，全部无法预留时才将 Unit 标记为 `skipped_budget`。
 
 ## 整体链路框架
@@ -51,8 +59,9 @@ review-agent trace <trace-id>
 - **可恢复**：Run 和 Review Unit 保存到 SQLite，重启后复用已经完成的工具和模型结果。
 - **预算限制**：每轮模型调用前预留费用，调用后按实际 token 结算；剩余预算不足时不发起调用并标记对应 Unit。
 - **Finding Trace**：每条评论能关联脱敏 diff、逐轮 Prompt、模型响应和工具结果。
-- **证据分级**：只有确定性规则能够验证的问题才标记为高置信度；模型结合工具推理但未命中规则的问题仍标记为仅供参考。
-- **安全边界**：Secret Scanner 在模型调用和内容落盘前运行；首版不执行用户仓库中的构建或测试脚本。
+- **证据分级**：只有 EvidenceRule 或可信 Checker 提供确定性证据时才标记为高置信度；纯模型推理标记为仅供参考。
+- **双链路 Finding**：LLM Candidate 经 Verifier 分级；`go vet/staticcheck` 的新增行诊断直接成为高置信度 Finding，最终统一去重。
+- **安全边界**：Secret Scanner 在模型调用和内容落盘前运行；不执行测试、`go generate`、Makefile 或仓库脚本，静态检查只在受限 Docker 容器运行。
 - **可扩展工具**：工具通过统一接口和 YAML 注册，新增工具不修改 Review Workflow。
 - **平台适配**：主流程只依赖统一的 `ChangeRef + Adapter`；首版注册 GitHub，后续可在 Registry 中增加 GitLab 实现。
 
@@ -72,7 +81,7 @@ Reviewer 使用有边界的结构化 Tool-Calling Loop，不解析自由文本 R
 - `read_file` 只读取首次固定的 `head_sha`，拒绝路径穿越和敏感文件。
 - `search_symbol` 首版只搜索固定且已脱敏的 PR diff。
 - 每轮模型调用独立记账；恢复时复用已经完成的 Agent Step。
-- Verifier 不主动调用模型或工具，只读取已落盘的 diff 与工具证据做确定性分类。
+- Verifier 不主动调用模型或工具，只复核 LLM Reviewer 的 Candidate，并读取已落盘的 diff 与工具证据做确定性分类。
 
 ## Review 工作流
 
@@ -82,6 +91,8 @@ PR URL
   → 获取并固定 base/head SHA Snapshot
   → 脱敏、切分并按风险排序 Review Unit
   → Reviewer 按需调用受限工具并提出候选问题
+  → Docker 沙箱对固定 head SHA 运行 go vet 和 staticcheck
+  → 只保留命中 PR 新增行的 Checker Diagnostic
   → Verifier 关联 diff 与工具证据，分类为 confirmed / advisory
   → 保存 checkpoint 和预算账本
   → 生成 Markdown 报告
@@ -90,6 +101,7 @@ PR URL
 - **Workflow** 管理任务状态、恢复和步骤顺序。
 - **Reviewer** 通过结构化 Agent Loop 补充上下文并发现候选问题。
 - **Verifier** 只用确定性规则决定问题是否为高置信度。
+- **Checker** 对整个固定仓库做类型与静态分析，结果不经过 LLM Verifier。
 - 每个 Unit 和 Agent Step 独立持久化；中断后只继续未完成部分。
 
 ## 项目结构
@@ -107,6 +119,7 @@ internal/
   llm/                     预算保护后的模型 Provider
   budget/                  模型费用预留与结算
   review/                  Reviewer 与单个 Unit 的 checkpoint 处理
+  checker/                 固定源码物化、Docker 沙箱、诊断解析与 checkpoint
   tools/                   声明式 Registry 与固定 Snapshot 工具
   verifier/                Finding 证据校验和置信度分级
   report/                  Markdown 报告生成

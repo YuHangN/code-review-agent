@@ -94,7 +94,7 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 			writer.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(writer, `{"base":{"sha":"base-sha"},"head":{"sha":"head-sha"}}`)
 		case "/repos/acme/payments/compare/base-sha...head-sha":
-			fmt.Fprint(writer, "diff --git a/config.yaml b/config.yaml\n+api_key: \""+secret+"\"\n")
+			fmt.Fprint(writer, "diff --git a/config.yaml b/config.yaml\n@@ -0,0 +1 @@\n+api_key: \""+secret+"\"\n")
 		default:
 			t.Fatalf("unexpected request path: %s", request.URL.Path)
 		}
@@ -120,6 +120,16 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "status=reported") || !strings.Contains(stdout.String(), "report_path="+outputPath) {
 		t.Fatalf("run stdout = %q, want completed report", stdout.String())
+	}
+	reportContent, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(reportContent), "高置信度，可直接采纳（0）") || !strings.Contains(string(reportContent), "仅供参考（0）") {
+		t.Fatalf("report contains a finding without an LLM candidate:\n%s", reportContent)
+	}
+	if strings.Contains(string(reportContent), secret) {
+		t.Fatalf("report leaked secret:\n%s", reportContent)
 	}
 
 	store, err := sqlite.Open(ctx, dbPath, sqlite.Options{BusyTimeout: 50 * time.Millisecond})
@@ -148,6 +158,13 @@ func TestExecuteRunFetchesAndPersistsGitHubSnapshot(t *testing.T) {
 	units, err := store.ListUnits(ctx, runID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	findings, err := store.ListVerifiedFindings(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("findings without LLM candidates = %#v", findings)
 	}
 	if storedRun.Status != domain.RunStatusReported || len(units) != 1 || units[0].Status != domain.UnitStatusCompleted {
 		t.Fatalf("run status = %q, units = %#v", storedRun.Status, units)

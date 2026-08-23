@@ -26,6 +26,9 @@ var reportsSQL string
 //go:embed 006_agent_steps.sql
 var agentStepsSQL string
 
+//go:embed 007_checker_runs.sql
+var checkerRunsSQL string
+
 // All 按版本号升序返回全部 migration。
 var All = []Migration{
 	{Version: 1, SQL: initialSQL},
@@ -34,4 +37,5 @@ var All = []Migration{
 	{Version: 4, SQL: verifiedFindingsSQL},
 	{Version: 5, SQL: reportsSQL},
 	{Version: 6, SQL: agentStepsSQL},
+	{Version: 7, SQL: checkerRunsSQL},
 }

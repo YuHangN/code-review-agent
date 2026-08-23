@@ -77,7 +77,7 @@ const (
 	ConfidenceAdvisory  Confidence = "advisory"
 )
 
-// VerifiedFinding 是经过确定性规则验证和去重后可进入报告的最终问题。
+// VerifiedFinding 是完成证据分级和去重后可进入报告的统一最终问题。
 type VerifiedFinding struct {
 	ID                 string
 	RunID              string

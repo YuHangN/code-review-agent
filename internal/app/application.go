@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/YuHangN/code-review-agent/internal/budget"
+	"github.com/YuHangN/code-review-agent/internal/checker"
 	"github.com/YuHangN/code-review-agent/internal/config"
 	"github.com/YuHangN/code-review-agent/internal/domain"
 	"github.com/YuHangN/code-review-agent/internal/llm"
@@ -283,11 +285,62 @@ func (application Application) execute(ctx context.Context, runID, owner, output
 		reviewer = review.NewRecoverableAgentReviewer(gateway, application.runtime.LLMFallbackOrder, application.runtime.MaxFindingsPerUnit, registry, agentLimits, application.store)
 	}
 	processor := review.NewUnitProcessor(application.store, reviewer, "llm_review", owner)
-	flow := workflow.New(application.store, processor, verifier.NewAggregator(application.store, verifier.NewDefault()), report.NewGenerator(application.store))
+	aggregator := verifier.NewAggregator(application.store, verifier.NewDefault())
+	reporter := report.NewGenerator(application.store)
+	flow := workflow.New(application.store, processor, aggregator, reporter)
+	if application.runtime.Checkers.Enabled {
+		checkerProcessor, err := application.checkerProcessor(ctx, runID)
+		if err != nil {
+			return workflow.Result{}, fmt.Errorf("configure checkers: %w", err)
+		}
+		flow = workflow.NewWithChecker(application.store, processor, checkerProcessor, aggregator, reporter)
+	}
 	return flow.Execute(ctx, workflow.ExecuteRequest{
 		RunID: runID, Owner: owner, OutputPath: outputPath,
 		Lease: workflow.LeaseSettings{TTL: application.runtime.LeaseTTL, RenewInterval: application.runtime.LeaseRenewInterval},
 	})
+}
+
+type archiveSource struct {
+	adapter scm.ArchiveAdapter
+	ref     scm.ChangeRef
+}
+
+func (source archiveSource) OpenArchive(ctx context.Context, _ domain.Run, sha string) (io.ReadCloser, error) {
+	return source.adapter.OpenArchive(ctx, source.ref, sha)
+}
+
+func (application Application) checkerProcessor(ctx context.Context, runID string) (checker.Processor, error) {
+	run, err := application.store.GetRun(ctx, runID)
+	if err != nil {
+		return checker.Processor{}, err
+	}
+	ref, err := changeRef(run)
+	if err != nil {
+		return checker.Processor{}, err
+	}
+	registry, err := application.scmRegistry()
+	if err != nil {
+		return checker.Processor{}, err
+	}
+	adapter, err := registry.Adapter(ref.Provider)
+	if err != nil {
+		return checker.Processor{}, err
+	}
+	archiveAdapter, ok := adapter.(scm.ArchiveAdapter)
+	if !ok {
+		return checker.Processor{}, fmt.Errorf("SCM adapter does not support fixed archives")
+	}
+	executor := checker.OSExecutor{}
+	runner, err := checker.NewResolvingDockerRunner(executor, checker.DockerSettings{Binary: application.runtime.Checkers.DockerBinary, Image: application.runtime.Checkers.Image, CPUs: application.runtime.Checkers.CPUs, Memory: application.runtime.Checkers.Memory, TmpSize: application.runtime.Checkers.TmpSize, PIDs: application.runtime.Checkers.PIDs, DependencyTimeout: application.runtime.Checkers.DependencyTimeout, Proxy: application.runtime.Checkers.Proxy})
+	if err != nil {
+		return checker.Processor{}, err
+	}
+	definitions := make([]checker.Definition, 0, len(application.runtime.Checkers.Definitions))
+	for _, definition := range application.runtime.Checkers.Definitions {
+		definitions = append(definitions, checker.Definition{Name: definition.Name, Implementation: definition.Implementation, Timeout: definition.Timeout})
+	}
+	return checker.NewProcessor(application.store, archiveSource{adapter: archiveAdapter, ref: ref}, runner, definitions), nil
 }
 
 func (application Application) scmRegistry() (scm.Registry, error) {

@@ -11,6 +11,7 @@ const (
 	RunStatusFetched     RunStatus = "fetched"
 	RunStatusPlanned     RunStatus = "planned"
 	RunStatusReviewing   RunStatus = "reviewing"
+	RunStatusChecking    RunStatus = "checking"
 	RunStatusAggregating RunStatus = "aggregating"
 	RunStatusReported    RunStatus = "reported"
 	RunStatusPublishing  RunStatus = "publishing"

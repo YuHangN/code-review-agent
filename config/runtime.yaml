@@ -23,3 +23,20 @@ llm:
       input_price_micros_per_million_tokens: 750000
       output_price_micros_per_million_tokens: 4500000
       max_output_tokens: 4000
+checkers:
+  enabled: true
+  docker_binary: docker
+  image: code-review-agent-checker:go1.26-staticcheck2026.1
+  cpus: "1"
+  memory: 1g
+  tmp_size: 1g
+  pids: 128
+  dependency_timeout: 2m
+  proxy: https://proxy.golang.org
+  definitions:
+    - name: go_vet
+      implementation: go_vet
+      timeout: 1m
+    - name: staticcheck
+      implementation: staticcheck
+      timeout: 1m

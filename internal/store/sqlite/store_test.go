@@ -150,6 +150,70 @@ func TestStoreCreateRunPersistsUnitsAcrossReopen(t *testing.T) {
 	}
 }
 
+func TestCheckerResultIsCheckpointedAtomically(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 8, 23, 10, 0, 0, 0, time.UTC)
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "review.db"), sqlite.Options{BusyTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	run := domain.Run{
+		ID: "run-checker", SourceURL: "https://github.com/acme/demo/pull/1", Provider: "github",
+		Repository: "acme/demo", ChangeNumber: 1, Status: domain.RunStatus("checking"),
+		BudgetLimitMicros: 1_000_000, CreatedAt: now, UpdatedAt: now,
+	}
+	unit := domain.ReviewUnit{
+		ID: "unit-checker", RunID: run.ID, UnitKey: "main.go#4-4", FilePath: "main.go",
+		StartLine: 4, EndLine: 4, DiffHunk: "@@ -3,0 +4 @@\n+fmt.Printf(\"%d\", \"x\")\n",
+		Risk: "medium", Status: domain.UnitStatusCompleted, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.CreateRun(ctx, run, []domain.ReviewUnit{unit}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRun(ctx, run.ID, "worker-a", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureCheckerRuns(ctx, run.ID, []string{"go_vet", "staticcheck"}, now); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimCheckerRun(ctx, run.ID, "go_vet", "worker-a", now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace := domain.ReviewTrace{
+		ID: "trace-checker", RunID: run.ID, UnitID: unit.ID, CallID: "checker-call",
+		Detector: "checker:go_vet", Status: "completed", Response: `{"code":"printf"}`, CreatedAt: now.Add(2 * time.Second),
+	}
+	diagnostic := domain.CheckerDiagnostic{
+		ID: "diagnostic-1", RunID: run.ID, CheckerRunID: claimed.ID, UnitID: unit.ID,
+		TraceID: trace.ID, Checker: "go_vet", File: "main.go", Line: 4, Column: 2,
+		Code: "printf", Message: "fmt.Printf format %d has arg of wrong type string", Severity: "high", CreatedAt: now.Add(2 * time.Second),
+	}
+	claimed.Command = []string{"go", "vet", "./..."}
+	claimed.ExitCode = 1
+	claimed.Output = "main.go:4:2: fmt.Printf format %d has arg of wrong type string"
+	if err := store.CompleteCheckerRun(ctx, claimed, []domain.CheckerDiagnostic{diagnostic}, []domain.ReviewTrace{trace}, "worker-a", now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	runs, err := store.ListCheckerRuns(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 2 || runs[0].Status != domain.CheckerStatusCompleted || runs[0].Attempt != 1 {
+		t.Fatalf("checker runs = %#v", runs)
+	}
+	diagnostics, err := store.ListCheckerDiagnostics(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 1 || diagnostics[0].TraceID != trace.ID || diagnostics[0].Message != diagnostic.Message {
+		t.Fatalf("checker diagnostics = %#v", diagnostics)
+	}
+}
+
 func TestSaveFetchedSnapshotRejectsIncompleteSnapshotWithoutAdvancingRun(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
